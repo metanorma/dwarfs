@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <exception>
+#include <iostream>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -46,12 +48,14 @@
 #endif
 
 #include <folly/Conv.h>
-#include <folly/portability/PThread.h>
+#include <folly/String.h>
 #include <folly/portability/Windows.h>
+#include <folly/system/HardwareConcurrency.h>
 #include <folly/system/ThreadName.h>
 
 #include "dwarfs/error.h"
-#include "dwarfs/semaphore.h"
+#include "dwarfs/logger.h"
+#include "dwarfs/os_access.h"
 #include "dwarfs/util.h"
 #include "dwarfs/worker_group.h"
 
@@ -59,76 +63,21 @@ namespace dwarfs {
 
 namespace {
 
-#ifdef _WIN32
-
-double get_thread_cpu_time(std::thread const& t) {
-  static_assert(sizeof(std::thread::id) == sizeof(DWORD),
-                "Win32 thread id type mismatch");
-  auto tid = t.get_id();
-  DWORD id;
-  std::memcpy(&id, &tid, sizeof(id));
-  HANDLE h = ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);
-  FILETIME t_create, t_exit, t_sys, t_user;
-  if (::GetThreadTimes(h, &t_create, &t_exit, &t_sys, &t_user)) {
-    uint64_t sys = (static_cast<uint64_t>(t_sys.dwHighDateTime) << 32) +
-                   t_sys.dwLowDateTime;
-    uint64_t user = (static_cast<uint64_t>(t_user.dwHighDateTime) << 32) +
-                    t_user.dwLowDateTime;
-    return 1e-7 * (sys + user);
-  }
-  throw std::runtime_error("get_thread_cpu_time");
-}
-
-#else
-
-pthread_t std_to_pthread_id(std::thread::id tid) {
-  static_assert(std::is_same_v<pthread_t, std::thread::native_handle_type>);
-  static_assert(sizeof(std::thread::id) ==
-                sizeof(std::thread::native_handle_type));
-  pthread_t id{0};
-  std::memcpy(&id, &tid, sizeof(id));
-  return id;
-}
-
-double get_thread_cpu_time(std::thread const& t) {
-#if __MACH__
-//  https://www.programcreek.com/cpp/?CodeExample=thread+cpu+usage
-      mach_msg_type_number_t count;
-      thread_basic_info_data_t info;
-      count = THREAD_BASIC_INFO_COUNT;
-      mach_port_t thread = pthread_mach_thread_np(std_to_pthread_id(t.get_id()));
-      if (::thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS) {
-        return (info.user_time.seconds + info.user_time.microseconds * 1e-6) +
-               (info.system_time.seconds + info.system_time.microseconds * 1e-6);
-      }
-#else
-  ::clockid_t cid;
-  struct ::timespec ts;
-  if (::pthread_getcpuclockid(std_to_pthread_id(t.get_id()), &cid) == 0 &&
-      ::clock_gettime(cid, &ts) == 0) {
-    return ts.tv_sec + 1e-9 * ts.tv_nsec;
-  }
-#endif
-  throw std::runtime_error("get_thread_cpu_time");
-}
-
-#endif
-
-} // namespace
-
-template <typename Policy>
+template <typename LoggerPolicy, typename Policy>
 class basic_worker_group final : public worker_group::impl, private Policy {
  public:
   template <typename... Args>
-  basic_worker_group(const char* group_name, size_t num_workers,
-                     size_t max_queue_len, int niceness [[maybe_unused]],
-                     Args&&... args)
+  basic_worker_group(logger& lgr, os_access const& os, const char* group_name,
+                     size_t num_workers, size_t max_queue_len,
+                     int niceness [[maybe_unused]], Args&&... args)
       : Policy(std::forward<Args>(args)...)
+      , LOG_PROXY_INIT(lgr)
+      , os_{os}
       , running_(true)
       , pending_(0)
       , max_queue_len_(max_queue_len) {
     if (num_workers < 1) {
-      DWARFS_THROW(runtime_error, "invalid number of worker threads");
+      num_workers = std::max(folly::hardware_concurrency(), 1u);
     }
 
     if (!group_name) {
@@ -142,6 +91,8 @@ class basic_worker_group final : public worker_group::impl, private Policy {
         do_work(niceness > 10);
       });
     }
+
+    check_set_affinity_from_enviroment(group_name);
   }
 
   basic_worker_group(const basic_worker_group&) = delete;
@@ -231,22 +182,60 @@ class basic_worker_group final : public worker_group::impl, private Policy {
     return jobs_.size();
   }
 
-  double get_cpu_time() const override {
+  folly::Expected<std::chrono::nanoseconds, std::error_code>
+  get_cpu_time() const override {
     std::lock_guard lock(mx_);
-    double t = 0.0;
+    std::chrono::nanoseconds t{};
 
-    // TODO:
-    // return workers_ | std::views::transform(get_thread_cpu_time) |
-    // std::ranges::accumulate;
     for (auto const& w : workers_) {
-      t += get_thread_cpu_time(w);
+      std::error_code ec;
+      t += os_.thread_get_cpu_time(w.get_id(), ec);
+      if (ec) {
+        return folly::makeUnexpected(ec);
+      }
     }
 
     return t;
   }
 
+  bool set_affinity(std::vector<int> const& cpus) override {
+    if (cpus.empty()) {
+      return false;
+    }
+
+    std::lock_guard lock(mx_);
+
+    for (size_t i = 0; i < workers_.size(); ++i) {
+      std::error_code ec;
+      os_.thread_set_affinity(workers_[i].get_id(), cpus, ec);
+      if (ec) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
  private:
   using jobs_t = std::queue<worker_group::job_t>;
+
+  void check_set_affinity_from_enviroment(const char* group_name) {
+    if (auto var = os_.getenv("DWARFS_WORKER_GROUP_AFFINITY")) {
+      std::vector<std::string_view> groups;
+      folly::split(':', var.value(), groups);
+
+      for (auto& group : groups) {
+        std::vector<std::string_view> parts;
+        folly::split('=', group, parts);
+
+        if (parts.size() == 2 && parts[0] == group_name) {
+          std::vector<int> cpus;
+          folly::split(',', parts[1], cpus);
+          set_affinity(cpus);
+        }
+      }
+    }
+  }
 
   // TODO: move out of this class
   static void set_thread_niceness(int niceness) {
@@ -303,7 +292,12 @@ class basic_worker_group final : public worker_group::impl, private Policy {
           ::SetThreadPriority(hthr, THREAD_MODE_BACKGROUND_BEGIN);
         }
 #endif
-        job();
+        try {
+          job();
+        } catch (...) {
+          LOG_FATAL << "exception thrown in worker thread: "
+                    << folly::exceptionStr(std::current_exception());
+        }
 #ifdef _WIN32
         if (is_background) {
           ::SetThreadPriority(hthr, THREAD_MODE_BACKGROUND_END);
@@ -321,6 +315,8 @@ class basic_worker_group final : public worker_group::impl, private Policy {
     }
   }
 
+  LOG_PROXY_DECL(LoggerPolicy);
+  os_access const& os_;
   std::vector<std::thread> workers_;
   jobs_t jobs_;
   std::condition_variable cond_;
@@ -340,9 +336,16 @@ class no_policy {
   };
 };
 
-worker_group::worker_group(const char* group_name, size_t num_workers,
+template <typename LoggerPolicy>
+using default_worker_group = basic_worker_group<LoggerPolicy, no_policy>;
+
+} // namespace
+
+worker_group::worker_group(logger& lgr, os_access const& os,
+                           const char* group_name, size_t num_workers,
                            size_t max_queue_len, int niceness)
-    : impl_{std::make_unique<basic_worker_group<no_policy>>(
-          group_name, num_workers, max_queue_len, niceness)} {}
+    : impl_{make_unique_logging_object<impl, default_worker_group,
+                                       logger_policies>(
+          lgr, os, group_name, num_workers, max_queue_len, niceness)} {}
 
 } // namespace dwarfs

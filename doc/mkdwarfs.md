@@ -2,9 +2,9 @@
 
 ## SYNOPSIS
 
-`mkdwarfs` `-i` *path* `-o` *file* [*options*...]  
-`mkdwarfs` `--input-list=`*file*|`-` `-o` *file* [*options*...]  
-`mkdwarfs` `-i` *file* `-o` *file* `--recompress` [*options*...]
+`mkdwarfs` `-i` *path* `-o` *file*\|`-` [*options*...]  
+`mkdwarfs` `--input-list=`*file*\|`-` `-o` *file*\|`-` [*options*...]  
+`mkdwarfs` `-i` *file* `-o` *file*\|`-` `--recompress` [*options*...]
 
 ## DESCRIPTION
 
@@ -32,7 +32,7 @@ There are two mandatory options for specifying the input and output:
   is the source filesystem.
 
 - `--input-list=`*file*|`-`:
-  Read list of paths to add to the file system from this file or from stdin.
+  Read list of file paths to add to the file system from this file or from stdin.
   The path names will be interpreted relative to the path given with `--input`.
   If `--input` is omitted, the path names will be interpreted relative to the
   current directory. If you want files to be stored in the exact same order
@@ -40,8 +40,8 @@ There are two mandatory options for specifying the input and output:
   by similarity or access frequency), you must also pass `--order=none`.
   This option implicitly enables both `--with-devices` and `--with-specials`.
 
-- `-o`, `--output=`*file*:
-  File name of the output filesystem.
+- `-o`, `--output=`*file*|`-`:
+  File name of the output filesystem or `-` to write the filesystem to stdout.
 
 - `-f`, `--force`:
   Force the output file to be overwritten if it already exists.
@@ -64,6 +64,10 @@ Most other options are concerned with compression tuning:
   `--schema-compression`, `--metadata-compression`, `--window-size`,
   `--window-step` and `--order`. See the output of `mkdwarfs --help` for
   a table listing the exact defaults used for each compression level.
+
+- `--categorize`[`=`*categorizer*[`,`...]]:
+  Enable one or more categorizers in the given order.
+  See [CATEGORIZERS](#categorizers) for more details.
 
 - `-S`, `--block-size-bits=`*value*:
   The block size used for the compressed filesystem. The actual block size
@@ -91,9 +95,8 @@ Most other options are concerned with compression tuning:
   and values greater than 10 are mapped to "background" priority.
 
 - `--num-scanner-workers=`*value*:
-  Number of worker threads used for building the filesystem. This defaults
-  to the number of processors available on your system. Use this option if
-  you want to limit the resources used by `mkdwarfs` or to optimize build
+  Number of worker threads used for scanning the filesystem. Use this option
+  if you want to limit the resources used by `mkdwarfs` or to optimize build
   speed. This option affects only the scanning phase. By default, the same
   value is used as for `--num-workers`.
   In the scanning phase, the worker threads are used to scan files in the
@@ -102,7 +105,20 @@ Most other options are concerned with compression tuning:
   computation, depending on the `--order` option. File discovery itself
   is single-threaded and runs independently from the scanning threads.
 
-- `-B`, `--max-lookback-blocks=`*value*:
+- `--num-segmenter-workers=`*value*:
+  Number of worker threads used for segmenting the input data. By default,
+  the same value is used as for `--num-workers`.
+  Segmenting the input data is one of the most time consuming tasks when
+  building a file system, and cannot easily be parallelized. However, when
+  using the categorizer, a separate segmenter will be used for each category
+  (and subcategory, if present). This option controls how many segmenters
+  can run simultaneously. When `--compress-niceness` is set to the default,
+  segmenter threads will always have a higher priority than compression
+  threads, making sure that compression doesn't slow down segmentation.
+  This option also controls the number of threads used for ordering the
+  input to the segmenter.
+
+- `-B`, `--max-lookback-blocks=[*category*`::`]`*value*:
   Specify how many of the most recent blocks to scan for duplicate segments.
   By default, only the current block will be scanned. The larger this number,
   the more duplicate segments will likely be found, which may further improve
@@ -111,7 +127,7 @@ Most other options are concerned with compression tuning:
   files can now potentially span multiple filesystem blocks. Passing `-B0`
   will completely disable duplicate segment search.
 
-- `-W`, `--window-size=`*value*:
+- `-W`, `--window-size=[*category*`::`]`*value*:
   Window size of cyclic hash used for segmenting. This is an exponent
   to a base of two. Cyclic hashes are used by `mkdwarfs` for finding
   identical segments across multiple files. This is done on top of duplicate
@@ -128,7 +144,7 @@ Most other options are concerned with compression tuning:
   size will grow. Passing `-W0` will completely disable duplicate segment
   search.
 
-- `-w`, `--window-step=`*value*:
+- `-w`, `--window-step=[*category*`::`]`*value*:
   This option specifies how often cyclic hash values are stored for lookup.
   It is specified relative to the window size, as a base-2 exponent that
   divides the window size. As a concrete example, if `--window-size=16`
@@ -141,7 +157,7 @@ Most other options are concerned with compression tuning:
   If you use a larger value for this option, the increments become *smaller*,
   and `mkdwarfs` will be slightly slower and use more memory.
 
-- `--bloom-filter-size`=*value*:
+- `--bloom-filter-size`=[*category*`::`]*value*:
   The segmenting algorithm uses a bloom filter to determine quickly if
   there is *no* match at a given position. This will filter out more than
   90% of bad matches quickly with the default bloom filter size. The default
@@ -161,7 +177,7 @@ Most other options are concerned with compression tuning:
   algorithms, so if you're short on memory it might be worth tweaking the
   compression options.
 
-- `-C`, `--compression=`*algorithm*[`:`*algopt*[`=`*value*][`:`...]]:
+- `-C`, `--compression=`[*category*`::`]*algorithm*[`:`*algopt*[`=`*value*][`:`...]]:
   The compression algorithm and configuration used for file system data.
   The value for this option is a colon-separated list. The first item is
   the compression algorithm, the remaining item are its options. Options
@@ -188,6 +204,13 @@ Most other options are concerned with compression tuning:
   care about mount time, you can safely choose `lzma` compression here, as
   the data will only have to be decompressed once when mounting the image.
 
+- `--history-compression=`*algorithm*[`:`*algopt*[`=`*value*][`,`...]]:
+  The compression algorithm and configuration used for the file system
+  history. Takes the same arguments as `--compression` above. Like the
+  schema, history blocks are typically very small, so the default is the
+  same as for schema compression. This is irrelevant if `--no-history`
+  is present.
+
 - `--recompress`[`=all`|`=block`|`=metadata`|`=none`]:
   Take an existing DwarFS file system and recompress it using different
   compression algorithms. If no argument or `all` is given, all sections
@@ -203,6 +226,12 @@ Most other options are concerned with compression tuning:
   are recompressed. This can be useful if you want to switch from compressed
   metadata to uncompressed metadata without having to rebuild or recompress
   all the other data.
+
+- `--recompress-categories=`[`!`]*category*[`,`...]:
+  When `--recompress` is set to `all` or `block`, this option controls
+  which categories of blocks will be recompressed. Adding a `!` in front
+  of the list allows you to specify which categories will *not* be
+  recompressed.
 
 - `-P`, `--pack-metadata=auto`|`none`|[`all`|`chunk_table`|`directories`|`shared_files`|`names`|`names_index`|`symlinks`|`symlinks_index`|`force`|`plain`[`,`...]]:
   Which metadata information to store in packed format. This is primarily
@@ -226,10 +255,14 @@ Most other options are concerned with compression tuning:
   size of the file system. If the input only has a single group already,
   setting this won't make any difference.
 
-- `--set-time=`*time*|`now`:
+- `--set-time=now`|*iso-8601-string*|*unix-timestamp*:
   Set the time stamps for all entities to this value. This can significantly
-  reduce the size of the file system. You can pass either a unix time stamp
-  or `now`.
+  reduce the size of the file system. You can pass the string `now` for the
+  current time, an ISO 8601 string, or a unix timestamp (seconds since epoch).
+  The ISO 8601 string supports a space character instead of the `T` between
+  date and time and supports dashes as separators. Seconds or the full time
+  part may be omitted as long as this doesn't turn the whole string into a
+  single number (i.e. `2008-03-17` is supported, but `20080317` is not).
 
 - `--keep-all-times`:
   As of release 0.3.0, by default, `mkdwarfs` will only save the contents of
@@ -251,39 +284,37 @@ Most other options are concerned with compression tuning:
   "normalize" the permissions across the file system; this is equivalent to
   using `--chmod=ug-st,=Xr`.
 
-- `--order=none`|`path`|`similarity`|`nilsimsa`[`:`*limit*[`:`*depth*[`:`*mindepth*]]]|`script`:
+- `--order=`[*category*`::`]`none`|`path`|`revpath`|`similarity`|`nilsimsa`[`:`*opt*[`=`*value*][`:`...]]:
   The order in which inodes will be written to the file system. Choosing `none`,
   the inodes will be stored in the order in which they are discovered. With
   `path`, they will be sorted asciibetically by path name of the first file
-  representing this inode. With `similarity`, they will be ordered using a
-  simple, yet fast and efficient, similarity hash function. `nilsimsa` ordering
-  uses a more sophisticated similarity function that is typically better than
-  `similarity`, but is significantly slower to compute. However, computation
-  can happen in the background while already building the file system.
-  `nilsimsa` ordering can be further tweaked by specifying a *limit* and
-  *depth*. The *limit* determines how soon an inode is considered similar
-  enough for adding. A *limit* of 255 means "essentially identical", whereas
-  a *limit* of 0 means "not similar at all". The *depth* determines up to
-  how many inodes can be checked at most while searching for a similar one.
-  To avoid `nilsimsa` ordering to become a bottleneck when ordering lots of
-  small files, the *depth* is adjusted dynamically to keep the input queue
-  to the segmentation/compression stages adequately filled. You can specify
-  how much the *depth* can be adjusted by also specifying *mindepth*.
-  The default if you omit these values is a *limit* of 255, a *depth*
-  of 20000 and a *mindepth* of 1000. Note that if you want reproducible
-  results, you need to set *depth* and *mindepth* to the same value. Also
-  note that when you're compressing lots (as in hundreds of thousands) of
-  small files, ordering them by `similarity` instead of `nilsimsa` is likely
-  going to speed things up significantly without impacting compression too much.
-  Last but not least, if scripting support is built into `mkdwarfs`, you can
-  choose `script` to let the script determine the order.
+  representing this inode. With `revpath`, they will also be ordered by path
+  name, but the path is being traversed from the leaf to the root, i.e. files
+  with the same name will be sorted next to each other. With `similarity`, they
+  will be ordered using a simple, yet fast and efficient, similarity hash
+  function.
+  `nilsimsa` ordering uses a more sophisticated similarity function that is
+  typically better than `similarity`, but can be significantly slower to
+  determine a good ordering.
+  However, the new implementation of this algorithm can be parallelized and
+  will perform much better on huge numbers of files. `nilsimsa` ordering can
+  be tweaked by specifying `max-children` and `max-cluster-size`. Both options
+  determine how the set of files will be split into clusters, each of which will
+  be further split recursively. `max-children` is the maximum number of child
+  nodes resulting from a clustering step. If `max-children` distinct clusters
+  have been found, new files will be added to the closest cluster. `max-cluster-size`
+  determines at which point a cluster will no longer be split further. Typically,
+  larger values will result in better ordering, but will also make the algorithm
+  slower. Unlike the old implementation, `nilsimsa` ordering is now completely
+  deterministic.
 
 - `--max-similarity-size=`*value*:
-  Don't perform similarity ordering for files larger than this size. This
-  helps speed up scanning, especially on slow file systems. For large files,
-  the gains from similarity ordering are relatively small. When this option
-  is set to a non-zero value, files larger than the limit will be stored first,
-  ordered by size in descending order.
+  Don't perform similarity ordering for fragments (or files if they are not split
+  into fragments by a categorizer) larger than this size. This helps speed up
+  scanning, especially on slow file systems. For large fragments, the gains from
+  similarity ordering are relatively small. When this option is set to a non-zero
+  value, fragments larger than the limit will be stored first, ordered by size in
+  descending order.
 
 - `-F`, `--filter=`*rule*:
   Add a filter rule. This option can be specified multiple times.
@@ -324,6 +355,17 @@ Most other options are concerned with compression tuning:
   and is used to speed up mount times for large file systems, as it avoids
   a full scan through the file system blocks to figure out their location.
 
+- `--no-history`:
+  Don't add any history information to a file system.
+
+- `--no-history-timestamps`:
+  Don't add timestamps to history entries. This is necessary, along with
+  `--no-create-timestamp`, when trying to produce bit-identical file system
+  images.
+
+- `--no-history-command-line`:
+  Don't record command line arguments in history entries.
+
 - `--no-create-timestamp`:
   Don't add a creation timestamp. This is useful when bit-identical file
   system images are required to be produced from the same input.
@@ -339,6 +381,10 @@ Most other options are concerned with compression tuning:
 - `--log-level=`*name*:
   Specifiy a logging level.
 
+- `--log-with-context`:
+  Enable logging context regardless of level. By default, context is enabled
+  if the level is `verbose`, `debug` or `trace`.
+
 - `--no-progress`:
   Don't show progress output while building filesystem.
 
@@ -352,6 +398,24 @@ Most other options are concerned with compression tuning:
   you can switch to `ascii`, which is like `unicode`, but looks less
   fancy.
 
+- `--incompressible-min-input-size=`*value*:
+  The minimum size of a file to be checked for incompressibility when
+  the `incompressible` categorizer is active.
+
+- `--incompressible-block-size=`*value*:
+  The block size used to test data for compressibility. This will also
+  be the size of the fragments when `--incompressible-fragments` is used.
+
+- `--incompressible-fragments`:
+  Categorize individual fragments of a file as incompressible instead of
+  only the file as a whole.
+
+- `--incompressible-ratio=`*value*:
+  The ratio above which a file or fragment is categorized as `incompressible`.
+
+- `--incompressible-zstd-level=`*value*:
+  The ZSTD compression level used for incompressible categorization.
+
 - `-h`, `--help`:
   Show usage and the most common basic options.
 
@@ -359,13 +423,89 @@ Most other options are concerned with compression tuning:
   Show full usage with all options, including defaults, compression level
   detail and supported compression algorithms.
 
-If experimental Python support was compiled into `mkdwarfs`, you can use the
-following option to enable customizations via the scripting interface:
+- `--man`:
+  If the project was built with support for built-in manual pages, this
+  option will show the manual page. If supported by the terminal and a
+  suitable pager (e.g. `less`) is found, the manual page is displayed
+  in the pager.
 
-- `--script=`*file*[`:`*class*[`(`arguments`...)`]]:
-  Specify the Python script to load. The class name is optional if there's
-  a class named `mkdwarfs` in the script. It is also possible to pass
-  arguments to the constructor.
+## EXIT CODES
+
+Upon successful completion, `mkdwarfs` will exit with exit code 0. If an
+unrecoverable error occurs (i.e. no valid file system image has been produced),
+it will exit with exit code 1. If any errors have occurred (e.g. not all input
+files could be read), the exit code will be 2.
+
+## CATEGORIZERS
+
+Categorizers will inspect the input files in the scanning phase and try to
+assign them a category. Each categorizer can define a set of categories,
+and each of these categories can optionally support subcategories.
+
+Running `mkdwarfs` with the `-H` or `--long-help` option will display the
+list of available categorizers and the categories they emit. At the moment,
+`mkdwarfs` supports two categorizers, `incompressible` and `pcmaudio`. The
+`incompressible` categorizer comes with its own set of options while the
+`pcmaudio` categorizer doesn't need any further configuration.
+
+Categorizers are only useful if at least some of the `mkdwarfs` configuration
+is category-dependent. The options that can be configured per category are
+`--compression`, `--order`, `--max-lookback-blocks`, `--window-size`,
+`--window-step`, and `--bloom-filter-size`.
+
+The resulting configuration matrix can be quite overwhelming, which is why
+`mkdwarfs` will run with a reasonable set of defaults if you specify the
+`--categorize` option with no arguments. These defaults are also dependent
+on the chosen compression level.
+
+Note that in case of the `pcmaudio` categorizer, you can override each option
+per category (in this case `pcmaudio/waveform` and `pcmaudio/metadata`).
+
+It's also worth noting that the order in which the categorizers are given
+is important. The first categorizer that will successfully categorize a
+file wins and, if possible, no other categorizers will run on the same
+file.
+
+### "incompressible" Categorizer
+
+The `incompressible` categorizer will try to compress each input with a
+very fast compression algorithm (`zstd` using a negative compression level
+by default). If it turns out that this doesn't reduce the size of the input
+significantly, the input will be categorized as `incompressible`.
+
+You can use the `incompressible` categorizer in two modes: whole-file or
+fragmented categorization. In the former, the whole input file will be
+categorized, whereas in the latter, each file can be further broken down
+into compressible and incompressible fragments. The size of these fragments
+will be equal to the block size used for categorization.
+
+It makes sense to use this categorizer as the last in a list of multiple
+categorizers. Not only because it'll likely have the biggest overhead, but
+also because it can wrongly classify data as incompressible that can be
+compressed properly with a specialized algorithm (e.g. audio data).
+
+### "pcmaudio" Categorizer
+
+The `pcmaudio` categorizer can identify and categorize a wide range of
+uncompressed audio data such as `.wav`, `.aiff` and more obscure formats.
+
+It produces two different categories: `pcmaudio/waveform` for the actual
+waveform data, and `pcmaudio/metadata` for all other data in the file such
+as the file header. The `pcmaudio/waveform` category is again divided into
+many subcategories depending on the type of waveform data (e.g. number of
+channels, bit depth, byte order, etc.).
+
+In order to efficiently compress `pcmaudio/waveform` data, a suitable
+compression algorithm must be selected for this category. `mkdwarfs`
+currently supports `flac` compression, which offers the best ratio of
+compression speed and achievable compression ratio.
+
+It is worth noting that options such as `--window-size` will operate on
+*sample* granularity instead of *byte* granularity when processing
+`pcmaudio/waveform` data, where *sample* granularity means one sample
+for each channel. For example, a 16-bit stereo file would have a
+granularity of 4 bytes and thus `--window-size=10` would refer to a
+4 KiB window instead of a 1 KiB windows.
 
 ## TIPS & TRICKS
 
@@ -507,17 +647,12 @@ at the cost of using a lot more memory when using the filesystem.
 ### Producing bit-identical images
 
 By default, images produced by `mkdwarfs` will not be identical
-over multiple runs. There are two reasons for this:
-
-- A creation timestamp is embedded in the image.
-
-- The `nilsimsa` ordering algorithm is not deterministic by
-  default.
+over multiple runs. This is due to time stamps that are being added
+to the file system image.
 
 In order to produce bit-identical images, you need to pass
-`--no-create-timestamp` and set `--order` to `path` or `similarity`.
-You could also set `--order=none` and pass in files explicitly
-using `--input-list`.
+`--no-create-timestamp` and either `--no-history-timestamps` or
+`--no-history`.
 
 ## FILTER RULES
 
@@ -637,7 +772,7 @@ own thread and continuously emits file inodes. These will be picked up
 by the segmenter thread, which scans the inode contents using a cyclic
 hash and determines overlapping segments between previously written
 data and new incoming data. The segmenter will look at up to
-`--max-lookback-block` previous filesystem blocks to find overlaps.
+`--max-lookback-blocks` previous filesystem blocks to find overlaps.
 
 Once the segmenter has produced enough data to fill a filesystem
 block, the block is added to a queue where from which the blocks

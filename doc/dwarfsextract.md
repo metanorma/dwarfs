@@ -86,6 +86,10 @@ to disk:
 - `-l`, `--log-level=`*name*:
   Specify a logging level.
 
+- `--log-with-context`:
+  Enable logging context regardless of level. By default, context is enabled
+  if the level is `verbose`, `debug` or `trace`.
+
 - `--perfmon=`*name*:
   Enable performance monitoring for the list of comma-separated components.
   This option is only available if the project was built with performance
@@ -94,6 +98,12 @@ to disk:
 
 - `-h`, `--help`:
   Show program help, including option defaults.
+
+- `--man`:
+  If the project was built with support for built-in manual pages, this
+  option will show the manual page. If supported by the terminal and a
+  suitable pager (e.g. `less`) is found, the manual page is displayed
+  in the pager.
 
 ## AUTHOR
 

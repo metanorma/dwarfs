@@ -24,7 +24,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "dwarfs/block_compressor.h" // TODO: or the other way round?
 #include "dwarfs/checksum.h"
@@ -46,6 +48,9 @@ enum class section_type : uint16_t {
 
   SECTION_INDEX = 9,
   // Section index.
+
+  HISTORY = 10,
+  // History of file system changes.
 };
 
 struct file_header {
@@ -56,7 +61,7 @@ struct file_header {
 
 struct section_header {
   section_type type;
-  compression_type compression;
+  compression_type_v1 compression;
   uint8_t unused;
   uint32_t length;
 
@@ -85,11 +90,15 @@ struct filesystem_info {
   uint64_t uncompressed_block_size{0};
   uint64_t compressed_metadata_size{0};
   uint64_t uncompressed_metadata_size{0};
+  bool uncompressed_block_size_is_estimate{false};
+  bool uncompressed_metadata_size_is_estimate{false};
+  std::vector<size_t> compressed_block_sizes;
+  std::vector<std::optional<size_t>> uncompressed_block_sizes;
 };
 
-bool is_valid_compression_type(compression_type type);
+bool is_known_compression_type(compression_type type);
 
-bool is_valid_section_type(section_type type);
+bool is_known_section_type(section_type type);
 
 std::string get_compression_name(compression_type type);
 

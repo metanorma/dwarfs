@@ -22,6 +22,9 @@
 #pragma once
 
 #include <iosfwd>
+#include <memory>
+#include <string>
+#include <string_view>
 
 namespace dwarfs {
 
@@ -43,18 +46,44 @@ enum class termcolor {
   BOLD_CYAN,
   BOLD_WHITE,
   BOLD_GRAY,
+  DIM_RED,
+  DIM_GREEN,
+  DIM_YELLOW,
+  DIM_BLUE,
+  DIM_MAGENTA,
+  DIM_CYAN,
+  DIM_WHITE,
+  DIM_GRAY,
   NUM_COLORS
 };
 
-void setup_terminal();
+enum class termstyle { NORMAL, BOLD, DIM };
 
-size_t get_term_width();
+class terminal {
+ public:
+  virtual ~terminal() = default;
 
-bool stream_is_fancy_terminal(std::ostream& os);
+  static std::unique_ptr<terminal const> create();
+  static void setup();
 
-char const* terminal_color(termcolor color);
+  virtual size_t width() const = 0;
+  virtual bool is_tty(std::ostream& os) const = 0;
+  virtual bool is_fancy() const = 0;
+  virtual std::string_view
+  color(termcolor color, termstyle style = termstyle::NORMAL) const = 0;
+  virtual std::string
+  colored(std::string text, termcolor color, bool enable = true,
+          termstyle style = termstyle::NORMAL) const = 0;
+  virtual std::string_view carriage_return() const = 0;
+  virtual std::string_view rewind_line() const = 0;
+  virtual std::string_view clear_line() const = 0;
+};
+
+std::string_view
+terminal_ansi_color(termcolor color, termstyle style = termstyle::NORMAL);
 
 std::string
-terminal_colored(std::string text, termcolor color, bool enable = true);
+terminal_ansi_colored(std::string_view text, termcolor color,
+                      bool enable = true, termstyle style = termstyle::NORMAL);
 
 } // namespace dwarfs

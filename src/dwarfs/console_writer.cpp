@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <sstream>
+#include <string_view>
 
 #include <fmt/format.h>
 
@@ -38,10 +39,19 @@ namespace dwarfs {
 
 namespace {
 
-constexpr std::array<char const*, 8> asc_bar{
+constexpr std::array<std::string_view, 8> asc_bar{
     {"=", "=", "=", "=", "=", "=", "=", "="}};
-constexpr std::array<char const*, 8> uni_bar{
+constexpr std::array<std::string_view, 8> uni_bar{
     {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"}};
+
+constexpr std::array<std::string_view, 4> asc_spinner_def{
+    {"-", "\\", "|", "/"}};
+
+constexpr std::array<std::string_view, 8> uni_spinner_def{
+    {"🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"}};
+
+constexpr std::span<std::string_view const> asc_spinner{asc_spinner_def};
+constexpr std::span<std::string_view const> uni_spinner{uni_spinner_def};
 
 std::string progress_bar(size_t width, double frac, bool unicode) {
   size_t barlen = 8 * width * frac;
@@ -64,48 +74,120 @@ std::string progress_bar(size_t width, double frac, bool unicode) {
   return rv;
 }
 
-} // namespace
+void output_context_line(terminal const& term, std::ostream& os,
+                         progress::context& ctx, size_t width, bool unicode_bar,
+                         bool colored) {
+  auto st = ctx.get_status();
+  size_t progress_w = 0;
+  size_t speed_w = 0;
 
-console_writer::console_writer(std::ostream& os, progress_mode pg_mode,
-                               get_term_width_type get_term_width,
-                               level_type threshold, display_mode mode,
-                               bool with_context)
-    : stream_logger(os, threshold, with_context)
-    , frac_(0.0)
-    , pg_mode_(pg_mode)
-    , get_term_width_(get_term_width)
-    , mode_(mode)
-    , debug_progress_(getenv_is_enabled("DWARFS_DEBUG_PROGRESS"))
-    , read_speed_{std::chrono::seconds(5)} {}
-
-void console_writer::rewind() {
-  if (!statebuf_.empty()) {
-    int lines = 0;
-
-    switch (mode_) {
-    case NORMAL:
-      lines = 9;
-      break;
-    case REWRITE:
-      lines = 4;
-      break;
-    }
-
-    auto& os = log_stream();
-
-    os << '\r';
-
-    for (int i = 0; i < lines; ++i) {
-      os << "\x1b[A";
+  // Progress bar width and speed width are both fixed
+  if (st.bytes_processed) {
+    speed_w = 12;
+    if (st.bytes_total) {
+      progress_w = width / 4;
     }
   }
+
+  assert(width >= progress_w + speed_w + 1);
+
+  size_t status_w = width - (progress_w + speed_w + 1);
+  auto path_len = st.path ? utf8_display_width(*st.path) : 0;
+  size_t extra_len = st.path && !st.status_string.empty() ? 2 : 0;
+
+  if (status_w <
+      st.context.size() + st.status_string.size() + path_len + extra_len) {
+    // need to shorten things
+    if (path_len > 0) {
+      auto max_path_len =
+          status_w -
+          std::min(status_w,
+                   st.context.size() + st.status_string.size() + extra_len);
+
+      if (max_path_len > 0) {
+        shorten_path_string(
+            *st.path,
+            static_cast<char>(std::filesystem::path::preferred_separator),
+            max_path_len);
+
+        path_len = utf8_display_width(*st.path);
+      }
+    }
+
+    if (path_len == 0 &&
+        status_w < st.context.size() + st.status_string.size()) {
+      if (status_w < st.context.size()) {
+        st.context.clear();
+      }
+
+      st.status_string.resize(status_w - st.context.size());
+    }
+  }
+
+  if (path_len > 0) {
+    if (!st.status_string.empty()) {
+      st.status_string += ": ";
+    }
+    st.status_string += *st.path;
+  }
+
+  std::string progress;
+  std::string speed;
+
+  if (st.bytes_processed) {
+    ctx.speed.put(*st.bytes_processed);
+    speed = fmt::format("{}/s", size_with_unit(ctx.speed.num_per_second()));
+
+    if (st.bytes_total) {
+      double frac = static_cast<double>(*st.bytes_processed) / *st.bytes_total;
+      progress = progress_bar(progress_w, frac, unicode_bar);
+    }
+  }
+
+  os << term.colored(st.context, st.color, colored, termstyle::BOLD);
+
+  os << term.colored(fmt::format("{:<{}} {}{}", st.status_string,
+                                 status_w - st.context.size(), progress, speed),
+                     st.color, colored);
 }
 
-void console_writer::preamble() { rewind(); }
+} // namespace
 
-void console_writer::postamble() {
+console_writer::console_writer(std::shared_ptr<terminal const> term,
+                               std::ostream& os, progress_mode pg_mode,
+                               display_mode mode, logger_options const& options)
+    : stream_logger(term, os, options)
+    , frac_(0.0)
+    , pg_mode_(pg_mode)
+    , mode_(mode) {}
+
+void console_writer::rewind(std::ostream& os, int next_rewind_lines) {
+  if (!statebuf_.empty()) {
+    auto& term = this->term();
+    auto clear_line = term.clear_line();
+    auto rewind_line = term.rewind_line();
+
+    os << term.carriage_return();
+
+    int num_erase = rewind_lines_ - next_rewind_lines;
+
+    for (int i = 0; i < rewind_lines_; ++i) {
+      os << rewind_line;
+      if (num_erase > 0) {
+        os << clear_line;
+        --num_erase;
+      }
+    }
+  }
+
+  rewind_lines_ = next_rewind_lines;
+}
+
+void console_writer::preamble(std::ostream& os) { rewind(os, rewind_lines_); }
+
+void console_writer::postamble(std::ostream& os) {
   if (pg_mode_ == UNICODE || pg_mode_ == ASCII) {
-    log_stream() << statebuf_;
+    os << statebuf_;
   }
 }
 
@@ -113,7 +195,7 @@ std::string_view console_writer::get_newline() const {
   return pg_mode_ != NONE ? "\x1b[K\n" : "\n";
 }
 
-void console_writer::update(const progress& p, bool last) {
+void console_writer::update(progress& p, bool last) {
   if (pg_mode_ == NONE && !last) {
     return;
   }
@@ -121,9 +203,25 @@ void console_writer::update(const progress& p, bool last) {
   auto newline = get_newline();
 
   std::ostringstream oss;
-  lazy_value width(get_term_width_);
+
+  lazy_value<size_t> width([this] { return term().width(); });
 
   bool fancy = pg_mode_ == ASCII || pg_mode_ == UNICODE;
+
+  auto update_chunk_size = [](progress::scan_progress& sp) {
+    if (auto usec = sp.usec.load(); usec > 10'000) {
+      auto bytes = sp.bytes.load();
+      auto bytes_per_second = (bytes << 20) / usec;
+      sp.chunk_size.store(std::min(
+          UINT64_C(1) << 25,
+          std::max(UINT64_C(1) << 15, std::bit_ceil(bytes_per_second / 32))));
+      sp.bytes_per_sec.store(bytes_per_second);
+    }
+  };
+
+  update_chunk_size(p.hash);
+  update_chunk_size(p.similarity);
+  update_chunk_size(p.categorize);
 
   if (last || fancy) {
     if (fancy) {
@@ -135,30 +233,10 @@ void console_writer::update(const progress& p, bool last) {
 
     switch (mode_) {
     case NORMAL:
-      if (writing_) {
-        read_speed_.put(p.total_bytes_read.load());
-      } else {
-        if (p.total_bytes_read.load() > 0) {
-          read_speed_.clear();
-          writing_ = true;
-        } else {
-          read_speed_.put(p.similarity_bytes.load());
-        }
-      }
-
       if (fancy) {
-        oss << terminal_colored(p.status(width.get()), termcolor::BOLD_CYAN,
-                                log_is_colored())
+        oss << term().colored(p.status(width.get()), termcolor::BOLD_CYAN,
+                              log_is_colored())
             << newline;
-      }
-
-      {
-        auto cur_size = p.current_size.load();
-        double cur_offs = std::min(p.current_offset.load(), cur_size);
-        double cur_frac = cur_size > 0 ? cur_offs / cur_size : 0.0;
-
-        oss << progress_bar(64, cur_frac, pg_mode_ == UNICODE) << " "
-            << size_with_unit(read_speed_.num_per_second()) << "/s" << newline;
       }
 
       oss << p.dirs_scanned << " dirs, " << p.symlinks_scanned << "/"
@@ -167,9 +245,15 @@ void console_writer::update(const progress& p, bool last) {
           << newline
 
           << "original size: " << size_with_unit(p.original_size)
-          << ", scanned: " << size_with_unit(p.similarity_bytes)
-          << ", hashed: " << size_with_unit(p.hash_bytes) << " ("
-          << p.hash_scans << " files)" << newline
+          << ", hashed: " << size_with_unit(p.hash.bytes) << " ("
+          << p.hash.scans << " files, " << size_with_unit(p.hash.bytes_per_sec)
+          << "/s)" << newline
+
+          << "scanned: " << size_with_unit(p.similarity.bytes) << " ("
+          << p.similarity.scans << " files, "
+          << size_with_unit(p.similarity.bytes_per_sec) << "/s)"
+          << ", categorizing: " << size_with_unit(p.categorize.bytes_per_sec)
+          << "/s" << newline
 
           << "saved by deduplication: "
           << size_with_unit(p.saved_by_deduplication) << " ("
@@ -177,24 +261,20 @@ void console_writer::update(const progress& p, bool last) {
           << size_with_unit(p.saved_by_segmentation) << newline
 
           << "filesystem: " << size_with_unit(p.filesystem_size) << " in "
-          << p.block_count << " blocks (" << p.chunk_count << " chunks, "
-          << (p.inodes_written > 0 ? p.inodes_written : p.inodes_scanned) << "/"
-          << p.files_found - p.duplicate_files - p.hardlinks << " inodes)"
+          << p.block_count << " blocks (" << p.chunk_count << " chunks, ";
+
+      if (p.fragments_written > 0) {
+        oss << p.fragments_written << "/" << p.fragments_found
+            << " fragments, ";
+      } else {
+        oss << p.fragments_found << " fragments, " << p.inodes_scanned << "/";
+      }
+
+      oss << p.files_found - p.duplicate_files - p.hardlinks << " inodes)"
           << newline
 
           << "compressed filesystem: " << p.blocks_written << " blocks/"
-          << size_with_unit(p.compressed_size) << " written";
-
-      if (debug_progress_) {
-        oss << " [" << p.nilsimsa_depth << "/" << p.blockify_queue << "/"
-            << p.compress_queue << "]";
-      } else {
-        if (p.nilsimsa_depth > 0) {
-          oss << " [depth: " << p.nilsimsa_depth << "]";
-        }
-      }
-
-      oss << newline;
+          << size_with_unit(p.compressed_size) << " written" << newline;
       break;
 
     case REWRITE:
@@ -212,7 +292,7 @@ void console_writer::update(const progress& p, bool last) {
   if (pg_mode_ == NONE) {
     if (INFO <= log_threshold()) {
       std::lock_guard lock(log_mutex());
-      log_stream() << oss.str();
+      write_nolock(oss.str());
     }
     return;
   }
@@ -237,30 +317,48 @@ void console_writer::update(const progress& p, bool last) {
     std::string tmp =
         fmt::format(" ==> {0:.0f}% done, {1} blocks/{2} written", 100 * frac_,
                     p.blocks_written.load(), size_with_unit(p.compressed_size));
+    std::lock_guard lock(log_mutex());
     if (tmp != statebuf_) {
       auto t = get_current_time_string();
       statebuf_ = tmp;
-      std::lock_guard lock(log_mutex());
-      log_stream() << "- " << t << statebuf_ << "\n";
+      write_nolock(fmt::format("- {}{}\n", t, statebuf_));
     }
     if (last) {
-      std::lock_guard lock(log_mutex());
-      log_stream() << oss.str();
+      write_nolock(oss.str());
     }
   } else {
-    oss << progress_bar(width.get() - 6, frac_, pg_mode_ == UNICODE)
-        << fmt::format("{:3.0f}% ", 100 * frac_) << "-\\|/"[counter_ % 4]
-        << '\n';
+    auto w = width.get();
+    auto spinner{pg_mode_ == UNICODE ? uni_spinner : asc_spinner};
+
+    oss << progress_bar(w - 8, frac_, pg_mode_ == UNICODE)
+        << fmt::format("{:3.0f}% ", 100 * frac_)
+        << spinner[counter_ % spinner.size()] << '\n';
 
     ++counter_;
 
-    std::lock_guard lock(log_mutex());
+    std::vector<std::shared_ptr<progress::context>> ctxs;
 
-    rewind();
+    if (w >= 60) {
+      ctxs = p.get_active_contexts();
+    }
+
+    for (auto const& c : ctxs) {
+      output_context_line(term(), oss, *c, w, pg_mode_ == UNICODE,
+                          log_is_colored());
+      oss << newline;
+    }
+
+    std::lock_guard lock(log_mutex());
 
     statebuf_ = oss.str();
 
-    log_stream() << statebuf_;
+    oss.clear();
+    oss.seekp(0);
+
+    rewind(oss, (mode_ == NORMAL ? 9 : 4) + ctxs.size());
+    oss << statebuf_;
+
+    write_nolock(oss.str());
   }
 }
 

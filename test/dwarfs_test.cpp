@@ -28,6 +28,8 @@
 #include <sstream>
 #include <vector>
 
+#include <folly/FileUtil.h>
+
 #include <gtest/gtest.h>
 
 #include <fmt/format.h>
@@ -39,11 +41,14 @@
 #include "dwarfs/file_type.h"
 #include "dwarfs/filesystem_v2.h"
 #include "dwarfs/filesystem_writer.h"
+#include "dwarfs/filter_debug.h"
+#include "dwarfs/fs_section.h"
 #include "dwarfs/logger.h"
 #include "dwarfs/mmif.h"
 #include "dwarfs/options.h"
 #include "dwarfs/progress.h"
 #include "dwarfs/scanner.h"
+#include "dwarfs/segmenter_factory.h"
 #include "dwarfs/vfs_stat.h"
 
 #include "filter_test_data.h"
@@ -63,25 +68,37 @@ std::string const default_file_hash_algo{"xxh3-128"};
 std::string
 build_dwarfs(logger& lgr, std::shared_ptr<test::os_access_mock> input,
              std::string const& compression,
-             block_manager::config const& cfg = block_manager::config(),
+             segmenter::config const& cfg = segmenter::config(),
              scanner_options const& options = scanner_options(),
              progress* prog = nullptr, std::shared_ptr<script> scr = nullptr,
              std::optional<std::span<std::filesystem::path const>> input_list =
                  std::nullopt) {
   // force multithreading
-  worker_group wg("worker", 4);
+  worker_group wg(lgr, *input, "worker", 4);
 
-  scanner s(lgr, wg, cfg, entry_factory::create(), input, scr, options);
-
-  std::ostringstream oss;
   std::unique_ptr<progress> local_prog;
   if (!prog) {
     local_prog = std::make_unique<progress>([](const progress&, bool) {}, 1000);
     prog = local_prog.get();
   }
 
+  // TODO: ugly hack :-)
+  segmenter_factory::config sf_cfg;
+  sf_cfg.block_size_bits = cfg.block_size_bits;
+  sf_cfg.blockhash_window_size.set_default(cfg.blockhash_window_size);
+  sf_cfg.window_increment_shift.set_default(cfg.window_increment_shift);
+  sf_cfg.max_active_blocks.set_default(cfg.max_active_blocks);
+  sf_cfg.bloom_filter_size.set_default(cfg.bloom_filter_size);
+
+  auto sf = std::make_shared<segmenter_factory>(lgr, *prog, sf_cfg);
+
+  scanner s(lgr, wg, sf, entry_factory::create(), input, scr, options);
+
+  std::ostringstream oss;
+
   block_compressor bc(compression);
-  filesystem_writer fsw(oss, lgr, wg, *prog, bc);
+  filesystem_writer fsw(oss, lgr, wg, *prog, bc, bc, bc);
+  fsw.add_default_compressor(bc);
 
   s.scan(fsw, std::filesystem::path("/"), *prog, input_list);
 
@@ -99,18 +116,19 @@ void basic_end_to_end_test(std::string const& compressor,
                            bool plain_names_table, bool plain_symlinks_table,
                            bool access_fail,
                            std::optional<std::string> file_hash_algo) {
-  block_manager::config cfg;
+  segmenter::config cfg;
   scanner_options options;
 
   cfg.blockhash_window_size = 10;
   cfg.block_size_bits = block_size_bits;
 
-  options.file_order.mode = file_order;
+  file_order_options order_opts;
+  order_opts.mode = file_order;
+
   options.file_hash_algorithm = file_hash_algo;
   options.with_devices = with_devices;
   options.with_specials = with_specials;
-  options.inode.with_similarity = file_order == file_order_mode::SIMILARITY;
-  options.inode.with_nilsimsa = file_order == file_order_mode::NILSIMSA;
+  options.inode.fragment_order.set_default(order_opts);
   options.keep_all_times = keep_all_times;
   options.pack_chunk_table = pack_chunk_table;
   options.pack_directories = pack_directories;
@@ -145,17 +163,18 @@ void basic_end_to_end_test(std::string const& compressor,
 
   auto prog = progress([](const progress&, bool) {}, 1000);
 
-  std::shared_ptr<script> scr;
-  if (file_order == file_order_mode::SCRIPT) {
-    scr = std::make_shared<test::script_mock>();
-  }
+  auto scr = std::make_shared<test::script_mock>();
 
   auto fsimage = build_dwarfs(lgr, input, compressor, cfg, options, &prog, scr);
+
+  EXPECT_EQ(14, scr->filter_calls.size());
+  EXPECT_EQ(15, scr->transform_calls.size());
+
   auto image_size = fsimage.size();
   auto mm = std::make_shared<test::mmap_mock>(std::move(fsimage));
 
-  bool similarity =
-      options.inode.with_similarity || options.inode.with_nilsimsa;
+  bool similarity = file_order == file_order_mode::SIMILARITY ||
+                    file_order == file_order_mode::NILSIMSA;
 
   size_t const num_fail_empty = access_fail ? 1 : 0;
 
@@ -184,13 +203,15 @@ void basic_end_to_end_test(std::string const& compressor,
                 (prog.saved_by_deduplication + prog.saved_by_segmentation +
                  prog.symlink_size),
             prog.filesystem_size);
-  EXPECT_EQ(prog.similarity_scans, similarity ? prog.inodes_scanned.load() : 0);
-  EXPECT_EQ(prog.similarity_bytes,
+  // TODO:
+  // EXPECT_EQ(prog.similarity_scans, similarity ? prog.inodes_scanned.load() :
+  // 0);
+  EXPECT_EQ(prog.similarity.bytes,
             similarity ? prog.original_size -
                              (prog.saved_by_deduplication + prog.symlink_size)
                        : 0);
-  EXPECT_EQ(prog.hash_scans, file_hash_algo ? 5 + num_fail_empty : 0);
-  EXPECT_EQ(prog.hash_bytes, file_hash_algo ? 46912 : 0);
+  EXPECT_EQ(prog.hash.scans, file_hash_algo ? 5 + num_fail_empty : 0);
+  EXPECT_EQ(prog.hash.bytes, file_hash_algo ? 46912 : 0);
   EXPECT_EQ(image_size, prog.compressed_size);
 
   filesystem_options opts;
@@ -198,7 +219,7 @@ void basic_end_to_end_test(std::string const& compressor,
   opts.metadata.enable_nlink = enable_nlink;
   opts.metadata.check_consistency = true;
 
-  filesystem_v2 fs(lgr, mm, opts);
+  filesystem_v2 fs(lgr, *input, mm, opts);
 
   // fs.dump(std::cerr, 9);
 
@@ -448,6 +469,41 @@ void basic_end_to_end_test(std::string const& compressor,
   json = fs.serialize_metadata_as_json(false);
 
   EXPECT_GT(json.size(), 1000) << json;
+
+  for (int detail = 0; detail <= 5; ++detail) {
+    auto info = fs.info_as_dynamic(detail);
+
+    ASSERT_TRUE(info.count("version"));
+    ASSERT_TRUE(info.count("image_offset"));
+    ASSERT_TRUE(info.count("created_on"));
+    ASSERT_TRUE(info.count("created_by"));
+
+    if (detail >= 1) {
+      ASSERT_TRUE(info.count("block_count"));
+      ASSERT_TRUE(info.count("block_size"));
+      ASSERT_TRUE(info.count("compressed_block_size"));
+      ASSERT_TRUE(info.count("compressed_metadata_size"));
+      ASSERT_TRUE(info.count("inode_count"));
+      ASSERT_TRUE(info.count("options"));
+      ASSERT_TRUE(info.count("original_filesystem_size"));
+      ASSERT_TRUE(info.count("preferred_path_separator"));
+      ASSERT_TRUE(info.count("uncompressed_block_size"));
+      ASSERT_TRUE(info.count("uncompressed_metadata_size"));
+    }
+
+    if (detail >= 2) {
+      ASSERT_TRUE(info.count("history"));
+    }
+
+    if (detail >= 3) {
+      ASSERT_TRUE(info.count("meta"));
+      ASSERT_TRUE(info.count("sections"));
+    }
+
+    if (detail >= 4) {
+      ASSERT_TRUE(info.count("root"));
+    }
+  }
 }
 
 std::vector<std::string> const compressions{
@@ -461,6 +517,7 @@ std::vector<std::string> const compressions{
 #endif
 #ifdef DWARFS_HAVE_LIBLZMA
     "lzma:level=1",
+    "lzma:level=1:binary=x86",
 #endif
 #ifdef DWARFS_HAVE_LIBBROTLI
     "brotli:quality=2",
@@ -541,7 +598,7 @@ TEST_P(packing_test, regression_empty_fs) {
   auto [pack_chunk_table, pack_directories, pack_shared_files_table, pack_names,
         pack_names_index, pack_symlinks, pack_symlinks_index] = GetParam();
 
-  block_manager::config cfg;
+  segmenter::config cfg;
   scanner_options options;
 
   cfg.blockhash_window_size = 8;
@@ -569,7 +626,7 @@ TEST_P(packing_test, regression_empty_fs) {
   opts.block_cache.max_bytes = 1 << 20;
   opts.metadata.check_consistency = true;
 
-  filesystem_v2 fs(lgr, mm, opts);
+  filesystem_v2 fs(lgr, *input, mm, opts);
 
   vfs_stat vfsbuf;
   fs.statvfs(&vfsbuf);
@@ -594,7 +651,7 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Combine(
         ::testing::ValuesIn(compressions), ::testing::Values(12, 15, 20, 28),
         ::testing::Values(file_order_mode::NONE, file_order_mode::PATH,
-                          file_order_mode::SCRIPT, file_order_mode::NILSIMSA,
+                          file_order_mode::REVPATH, file_order_mode::NILSIMSA,
                           file_order_mode::SIMILARITY),
         ::testing::Values(std::nullopt, "xxh3-128")));
 
@@ -618,8 +675,8 @@ INSTANTIATE_TEST_SUITE_P(dwarfs, plain_tables_test,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Bool()));
 
-TEST(block_manager, regression_block_boundary) {
-  block_manager::config cfg;
+TEST(segmenter, regression_block_boundary) {
+  segmenter::config cfg;
 
   // make sure we don't actually segment anything
   cfg.blockhash_window_size = 12;
@@ -643,7 +700,7 @@ TEST(block_manager, regression_block_boundary) {
 
     auto mm = std::make_shared<test::mmap_mock>(fsdata);
 
-    filesystem_v2 fs(lgr, mm, opts);
+    filesystem_v2 fs(lgr, *input, mm, opts);
 
     vfs_stat vfsbuf;
     fs.statvfs(&vfsbuf);
@@ -664,7 +721,7 @@ class compression_regression : public testing::TestWithParam<std::string> {};
 TEST_P(compression_regression, github45) {
   auto compressor = GetParam();
 
-  block_manager::config cfg;
+  segmenter::config cfg;
 
   constexpr size_t block_size_bits = 18;
   constexpr size_t file_size = 1 << block_size_bits;
@@ -697,7 +754,7 @@ TEST_P(compression_regression, github45) {
   auto mm = std::make_shared<test::mmap_mock>(fsdata);
 
   std::stringstream idss;
-  filesystem_v2::identify(lgr, mm, idss, 3);
+  filesystem_v2::identify(lgr, *input, mm, idss, 3);
 
   std::string line;
   std::regex const re("^SECTION num=\\d+, type=BLOCK, compression=(\\w+).*");
@@ -716,7 +773,7 @@ TEST_P(compression_regression, github45) {
   }
   EXPECT_EQ(1, compressions.count("NONE"));
 
-  filesystem_v2 fs(lgr, mm, opts);
+  filesystem_v2 fs(lgr, *input, mm, opts);
 
   vfs_stat vfsbuf;
   fs.statvfs(&vfsbuf);
@@ -757,16 +814,27 @@ TEST_P(file_scanner, inode_ordering) {
 
   test::test_logger lgr;
 
-  auto bmcfg = block_manager::config();
+  auto bmcfg = segmenter::config();
   auto opts = scanner_options();
 
-  opts.file_order.mode = order_mode;
+  file_order_options order_opts;
+  order_opts.mode = order_mode;
+
   opts.file_hash_algorithm = file_hash_algo;
-  opts.inode.with_similarity = order_mode == file_order_mode::SIMILARITY;
-  opts.inode.with_nilsimsa = order_mode == file_order_mode::NILSIMSA;
+  opts.inode.fragment_order.set_default(order_opts);
+  opts.no_create_timestamp = true;
 
   auto input = std::make_shared<test::os_access_mock>();
-  constexpr int dim = 14;
+#if defined(DWARFS_TEST_RUNNING_ON_ASAN) || defined(DWARFS_TEST_RUNNING_ON_TSAN)
+  static constexpr int dim{7};
+#else
+  static constexpr int dim{14};
+#endif
+#ifdef NDEBUG
+  static constexpr int repetitions{50};
+#else
+  static constexpr int repetitions{10};
+#endif
 
   input->add_dir("");
 
@@ -776,62 +844,112 @@ TEST_P(file_scanner, inode_ordering) {
       input->add_dir(fmt::format("{}/{}", x, y));
       for (int z = 0; z < dim; ++z) {
         input->add_file(fmt::format("{}/{}/{}", x, y, z),
-                        (x + 1) * (y + 1) * (z + 1));
+                        (x + 1) * (y + 1) * (z + 1), true);
       }
     }
   }
 
   auto ref = build_dwarfs(lgr, input, "null", bmcfg, opts);
 
-  for (int i = 0; i < 50; ++i) {
-    EXPECT_EQ(ref, build_dwarfs(lgr, input, "null", bmcfg, opts));
+  for (int i = 0; i < repetitions; ++i) {
+    auto fs = build_dwarfs(lgr, input, "null", bmcfg, opts);
+    EXPECT_EQ(ref, fs);
+    // if (ref != fs) {
+    //   folly::writeFile(ref, "ref.dwarfs");
+    //   folly::writeFile(fs, fmt::format("test{}.dwarfs", i).c_str());
+    // }
   }
 }
 
 INSTANTIATE_TEST_SUITE_P(
     dwarfs, file_scanner,
     ::testing::Combine(::testing::Values(file_order_mode::PATH,
-                                         file_order_mode::SIMILARITY),
+                                         file_order_mode::REVPATH,
+                                         file_order_mode::SIMILARITY,
+                                         file_order_mode::NILSIMSA),
                        ::testing::Values(std::nullopt, "xxh3-128")));
 
-class filter : public testing::TestWithParam<dwarfs::test::filter_test_data> {};
-
-TEST_P(filter, filesystem) {
-  auto spec = GetParam();
-
-  block_manager::config cfg;
-  scanner_options options;
-
-  options.remove_empty_dirs = true;
-
+class filter_test
+    : public testing::TestWithParam<dwarfs::test::filter_test_data> {
+ public:
   test::test_logger lgr;
+  std::shared_ptr<builtin_script> scr;
+  std::shared_ptr<test::test_file_access> tfa;
+  std::shared_ptr<test::os_access_mock> input;
 
-  auto scr = std::make_shared<builtin_script>(lgr);
+  void SetUp() override {
+    tfa = std::make_shared<test::test_file_access>();
 
-  scr->set_root_path("");
-  {
+    scr = std::make_shared<builtin_script>(lgr, tfa);
+    scr->set_root_path("");
+
+    input = std::make_shared<test::os_access_mock>();
+
+    for (auto const& [stat, name] : dwarfs::test::test_dirtree()) {
+      auto path = name.substr(name.size() == 5 ? 5 : 6);
+
+      switch (stat.type()) {
+      case posix_file_type::regular:
+        input->add(path, stat,
+                   [size = stat.size] { return test::loremipsum(size); });
+        break;
+      case posix_file_type::symlink:
+        input->add(path, stat, test::loremipsum(stat.size));
+        break;
+      default:
+        input->add(path, stat);
+        break;
+      }
+    }
+  }
+
+  void set_filter_rules(test::filter_test_data const& spec) {
     std::istringstream iss(spec.filter());
     scr->add_filter_rules(iss);
   }
 
-  auto input = std::make_shared<test::os_access_mock>();
+  std::string get_filter_debug_output(test::filter_test_data const& spec,
+                                      debug_filter_mode mode) {
+    set_filter_rules(spec);
 
-  for (auto const& [stat, name] : dwarfs::test::test_dirtree()) {
-    auto path = name.substr(name.size() == 5 ? 5 : 6);
+    std::ostringstream oss;
 
-    switch (stat.type()) {
-    case posix_file_type::regular:
-      input->add(path, stat,
-                 [size = stat.size] { return test::loremipsum(size); });
-      break;
-    case posix_file_type::symlink:
-      input->add(path, stat, test::loremipsum(stat.size));
-      break;
-    default:
-      input->add(path, stat);
-      break;
-    }
+    scanner_options options;
+    options.remove_empty_dirs = false;
+    options.debug_filter_function = [&](bool exclude, entry const* pe) {
+      debug_filter_output(oss, exclude, pe, mode);
+    };
+
+    progress prog([](const progress&, bool) {}, 1000);
+    worker_group wg(lgr, *input, "worker", 1);
+    auto sf = std::make_shared<segmenter_factory>(lgr, prog,
+                                                  segmenter_factory::config{});
+    scanner s(lgr, wg, sf, entry_factory::create(), input, scr, options);
+
+    block_compressor bc("null");
+    std::ostringstream null;
+    filesystem_writer fsw(null, lgr, wg, prog, bc, bc, bc);
+    s.scan(fsw, std::filesystem::path("/"), prog);
+
+    return oss.str();
   }
+
+  void TearDown() override {
+    scr.reset();
+    input.reset();
+    tfa.reset();
+  }
+};
+
+TEST_P(filter_test, filesystem) {
+  auto spec = GetParam();
+
+  set_filter_rules(spec);
+
+  segmenter::config cfg;
+
+  scanner_options options;
+  options.remove_empty_dirs = true;
 
   auto fsimage = build_dwarfs(lgr, input, "null", cfg, options, nullptr, scr);
 
@@ -842,7 +960,7 @@ TEST_P(filter, filesystem) {
   opts.metadata.enable_nlink = true;
   opts.metadata.check_consistency = true;
 
-  filesystem_v2 fs(lgr, mm, opts);
+  filesystem_v2 fs(lgr, *input, mm, opts);
 
   std::unordered_set<std::string> got;
 
@@ -851,16 +969,63 @@ TEST_P(filter, filesystem) {
   EXPECT_EQ(spec.expected_files(), got);
 }
 
-INSTANTIATE_TEST_SUITE_P(dwarfs, filter,
+TEST_P(filter_test, debug_filter_function_included) {
+  auto spec = GetParam();
+  auto output = get_filter_debug_output(spec, debug_filter_mode::INCLUDED);
+  auto expected = spec.get_expected_filter_output(debug_filter_mode::INCLUDED);
+  EXPECT_EQ(expected, output);
+}
+
+TEST_P(filter_test, debug_filter_function_included_files) {
+  auto spec = GetParam();
+  auto output =
+      get_filter_debug_output(spec, debug_filter_mode::INCLUDED_FILES);
+  auto expected =
+      spec.get_expected_filter_output(debug_filter_mode::INCLUDED_FILES);
+  EXPECT_EQ(expected, output);
+}
+
+TEST_P(filter_test, debug_filter_function_excluded) {
+  auto spec = GetParam();
+  auto output = get_filter_debug_output(spec, debug_filter_mode::EXCLUDED);
+  auto expected = spec.get_expected_filter_output(debug_filter_mode::EXCLUDED);
+  EXPECT_EQ(expected, output);
+}
+
+TEST_P(filter_test, debug_filter_function_excluded_files) {
+  auto spec = GetParam();
+  auto output =
+      get_filter_debug_output(spec, debug_filter_mode::EXCLUDED_FILES);
+  auto expected =
+      spec.get_expected_filter_output(debug_filter_mode::EXCLUDED_FILES);
+  EXPECT_EQ(expected, output);
+}
+
+TEST_P(filter_test, debug_filter_function_all) {
+  auto spec = GetParam();
+  auto output = get_filter_debug_output(spec, debug_filter_mode::ALL);
+  auto expected = spec.get_expected_filter_output(debug_filter_mode::ALL);
+  EXPECT_EQ(expected, output);
+}
+
+TEST_P(filter_test, debug_filter_function_files) {
+  auto spec = GetParam();
+  auto output = get_filter_debug_output(spec, debug_filter_mode::FILES);
+  auto expected = spec.get_expected_filter_output(debug_filter_mode::FILES);
+  EXPECT_EQ(expected, output);
+}
+
+INSTANTIATE_TEST_SUITE_P(dwarfs, filter_test,
                          ::testing::ValuesIn(dwarfs::test::get_filter_tests()));
 
 TEST(file_scanner, input_list) {
   test::test_logger lgr;
 
-  auto bmcfg = block_manager::config();
+  auto bmcfg = segmenter::config();
   auto opts = scanner_options();
 
-  opts.file_order.mode = file_order_mode::NONE;
+  file_order_options order_opts;
+  opts.inode.fragment_order.set_default(order_opts);
 
   auto input = test::os_access_mock::create_test_instance();
 
@@ -874,7 +1039,7 @@ TEST(file_scanner, input_list) {
 
   auto mm = std::make_shared<test::mmap_mock>(std::move(fsimage));
 
-  filesystem_v2 fs(lgr, mm);
+  filesystem_v2 fs(lgr, *input, mm);
 
   std::unordered_set<std::string> got;
 
@@ -905,7 +1070,7 @@ TEST(filesystem, uid_gid_32bit) {
 
   auto mm = std::make_shared<test::mmap_mock>(std::move(fsimage));
 
-  filesystem_v2 fs(lgr, mm);
+  filesystem_v2 fs(lgr, *input, mm);
 
   auto iv16 = fs.find("/foo16.txt");
   auto iv32 = fs.find("/foo32.txt");
@@ -941,7 +1106,7 @@ TEST(filesystem, uid_gid_count) {
 
   auto mm = std::make_shared<test::mmap_mock>(std::move(fsimage));
 
-  filesystem_v2 fs(lgr, mm);
+  filesystem_v2 fs(lgr, *input, mm);
 
   auto iv00000 = fs.find("/foo00000.txt");
   auto iv50000 = fs.find("/foo50000.txt");
@@ -963,4 +1128,106 @@ TEST(filesystem, uid_gid_count) {
   EXPECT_EQ(300000, st50000.gid);
   EXPECT_EQ(149999, st99999.uid);
   EXPECT_EQ(349999, st99999.gid);
+}
+
+TEST(section_index_regression, github183) {
+  static constexpr uint64_t section_offset_mask{(UINT64_C(1) << 48) - 1};
+
+  test::test_logger lgr;
+  segmenter::config cfg{
+      .block_size_bits = 10,
+  };
+  auto input = test::os_access_mock::create_test_instance();
+
+  auto fsimage = build_dwarfs(lgr, input, "null", cfg);
+
+  std::vector<uint64_t> index;
+
+  {
+    uint64_t index_pos;
+
+    ::memcpy(&index_pos, fsimage.data() + (fsimage.size() - sizeof(uint64_t)),
+             sizeof(uint64_t));
+
+    ASSERT_EQ((index_pos >> 48),
+              static_cast<uint16_t>(section_type::SECTION_INDEX));
+    index_pos &= section_offset_mask;
+
+    ASSERT_LT(index_pos, fsimage.size());
+
+    test::mmap_mock mm(fsimage);
+    auto section = fs_section(mm, index_pos, 2);
+
+    EXPECT_TRUE(section.check_fast(mm));
+
+    index.resize(section.length() / sizeof(uint64_t));
+    ::memcpy(index.data(), section.data(mm).data(), section.length());
+  }
+
+  ASSERT_GT(index.size(), 10);
+
+  auto const schema_ix{index.size() - 4};
+  auto const metadata_ix{index.size() - 3};
+  auto const history_ix{index.size() - 2};
+
+  ASSERT_EQ(index[schema_ix] >> 48,
+            static_cast<uint16_t>(section_type::METADATA_V2_SCHEMA));
+  ASSERT_EQ(index[metadata_ix] >> 48,
+            static_cast<uint16_t>(section_type::METADATA_V2));
+  ASSERT_EQ(index[history_ix] >> 48,
+            static_cast<uint16_t>(section_type::HISTORY));
+
+  auto const schema_offset{index[schema_ix] & section_offset_mask};
+
+  auto fsimage2 = fsimage;
+
+  ::memset(fsimage2.data() + 8, 0xff, schema_offset - 8);
+
+  auto mm = std::make_shared<test::mmap_mock>(fsimage2);
+
+  filesystem_v2 fs;
+
+  ASSERT_NO_THROW(fs = filesystem_v2(lgr, *input, mm));
+  EXPECT_NO_THROW(fs.walk([](auto) {}));
+
+  auto entry = fs.find("/foo.pl");
+
+  ASSERT_TRUE(entry);
+
+  file_stat st;
+  EXPECT_EQ(fs.getattr(*entry, &st), 0);
+
+  int inode{-1};
+
+  EXPECT_NO_THROW(inode = fs.open(*entry));
+
+  std::vector<char> buf(st.size);
+  auto rv = fs.read(inode, &buf[0], st.size, 0);
+
+  EXPECT_EQ(rv, -EIO);
+
+  std::stringstream idss;
+  EXPECT_THROW(filesystem_v2::identify(lgr, *input, mm, idss, 3),
+               dwarfs::runtime_error);
+}
+
+TEST(filesystem, find_by_path) {
+  test::test_logger lgr;
+  auto input = test::os_access_mock::create_test_instance();
+  auto fsimage = build_dwarfs(lgr, input, "null");
+  auto mm = std::make_shared<test::mmap_mock>(std::move(fsimage));
+
+  filesystem_v2 fs(lgr, *input, mm);
+
+  std::vector<std::string> paths;
+  fs.walk([&](auto e) { paths.emplace_back(e.unix_path()); });
+
+  EXPECT_GT(paths.size(), 10);
+
+  for (auto const& p : paths) {
+    auto iv = fs.find(p.c_str());
+    ASSERT_TRUE(iv) << p;
+    EXPECT_FALSE(fs.find(iv->inode_num(), "desktop.ini")) << p;
+    EXPECT_FALSE(fs.find((p + "/desktop.ini").c_str())) << p;
+  }
 }

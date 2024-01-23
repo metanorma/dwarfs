@@ -20,6 +20,7 @@
  */
 
 #include <cstring>
+#include <exception>
 #include <iterator>
 #include <stdexcept>
 
@@ -43,56 +44,119 @@
 
 namespace dwarfs {
 
+namespace {
+
+constexpr std::array<std::pair<std::string_view, logger::level_type>, 6>
+    log_level_map = {{
+        {"error", logger::ERROR},
+        {"warn", logger::WARN},
+        {"info", logger::INFO},
+        {"verbose", logger::VERBOSE},
+        {"debug", logger::DEBUG},
+        {"trace", logger::TRACE},
+    }};
+
+}
+
+std::ostream& operator<<(std::ostream& os, logger::level_type const& optval) {
+  return os << logger::level_name(optval);
+}
+
+std::istream& operator>>(std::istream& is, logger::level_type& optval) {
+  std::string s;
+  is >> s;
+  optval = logger::parse_level(s);
+  return is;
+}
+
 logger::level_type logger::parse_level(std::string_view level) {
-  if (level == "error") {
-    return ERROR;
-  }
-  if (level == "warn") {
-    return WARN;
-  }
-  if (level == "info") {
-    return INFO;
-  }
-  if (level == "debug") {
-    return DEBUG;
-  }
-  if (level == "trace") {
-    return TRACE;
+  // don't parse FATAL here, it's a special case
+  for (auto const& [name, lvl] : log_level_map) {
+    if (level == name) {
+      return lvl;
+    }
   }
   DWARFS_THROW(runtime_error, fmt::format("invalid logger level: {}", level));
 }
 
-stream_logger::stream_logger(std::ostream& os, level_type threshold,
-                             bool with_context)
-    : os_(os)
-    , color_(stream_is_fancy_terminal(os))
-    , enable_stack_trace_{getenv_is_enabled("DWARFS_LOGGER_STACK_TRACE")}
-    , with_context_(with_context) {
-  set_threshold(threshold);
+std::string_view logger::level_name(level_type level) {
+  for (auto const& [name, lvl] : log_level_map) {
+    if (level == lvl) {
+      return name;
+    }
+  }
+  DWARFS_THROW(runtime_error, fmt::format("invalid logger level: {}",
+                                          static_cast<int>(level)));
 }
 
-void stream_logger::preamble() {}
-void stream_logger::postamble() {}
+std::string logger::all_level_names() {
+  std::string result;
+  for (auto const& m : log_level_map) {
+    if (!result.empty()) {
+      result += ", ";
+    }
+    result += m.first;
+  }
+  return result;
+}
+
+stream_logger::stream_logger(std::shared_ptr<terminal const> term,
+                             std::ostream& os, logger_options const& logopts)
+    : os_(os)
+    , color_(term->is_tty(os) && term->is_fancy())
+    , enable_stack_trace_{getenv_is_enabled("DWARFS_LOGGER_STACK_TRACE")}
+    , with_context_(logopts.with_context ? logopts.with_context.value()
+                                         : logopts.threshold >= logger::VERBOSE)
+    , term_{std::move(term)} {
+  set_threshold(logopts.threshold);
+}
+
+void stream_logger::preamble(std::ostream&) {}
+void stream_logger::postamble(std::ostream&) {}
 std::string_view stream_logger::get_newline() const { return "\n"; }
+
+void stream_logger::write_nolock(std::string_view output) {
+  if (&os_ == &std::cerr) {
+    fmt::print(stderr, "{}", output);
+  } else {
+    os_ << output;
+  }
+}
 
 void stream_logger::write(level_type level, const std::string& output,
                           char const* file, int line) {
-  if (level <= threshold_) {
+  if (level <= threshold_ || level == FATAL) {
     auto t = get_current_time_string();
-    const char* prefix = "";
-    const char* suffix = "";
+    std::string_view prefix;
+    std::string_view suffix;
     auto newline = get_newline();
 
     if (color_) {
       switch (level) {
+      case FATAL:
       case ERROR:
-        prefix = terminal_color(termcolor::BOLD_RED);
-        suffix = terminal_color(termcolor::NORMAL);
+        prefix = term_->color(termcolor::BOLD_RED);
+        suffix = term_->color(termcolor::NORMAL);
         break;
 
       case WARN:
-        prefix = terminal_color(termcolor::BOLD_YELLOW);
-        suffix = terminal_color(termcolor::NORMAL);
+        prefix = term_->color(termcolor::BOLD_YELLOW);
+        suffix = term_->color(termcolor::NORMAL);
+        break;
+
+      case VERBOSE:
+        prefix = term_->color(termcolor::DIM_CYAN);
+        suffix = term_->color(termcolor::NORMAL);
+        break;
+
+      case DEBUG:
+        prefix = term_->color(termcolor::DIM_YELLOW);
+        suffix = term_->color(termcolor::NORMAL);
+        break;
+
+      case TRACE:
+        prefix = term_->color(termcolor::GRAY);
+        suffix = term_->color(termcolor::NORMAL);
         break;
 
       default:
@@ -104,7 +168,7 @@ void stream_logger::write(level_type level, const std::string& output,
     std::string stacktrace;
     std::vector<std::string_view> st_lines;
 
-    if (enable_stack_trace_) {
+    if (enable_stack_trace_ || level == FATAL) {
       using namespace folly::symbolizer;
       Symbolizer symbolizer(LocationInfoMode::FULL);
       FrameArray<8> addresses;
@@ -130,26 +194,32 @@ void stream_logger::write(level_type level, const std::string& output,
       context_len = context.size();
       if (color_) {
         context = folly::to<std::string>(
-            suffix, terminal_color(termcolor::MAGENTA), context,
-            terminal_color(termcolor::NORMAL), prefix);
+            suffix, term_->color(termcolor::DIM_MAGENTA), context,
+            term_->color(termcolor::NORMAL), prefix);
       }
     }
 
+    std::string tmp;
     folly::small_vector<std::string_view, 2> lines;
-    folly::split('\n', output, lines);
+
+    if (output.find('\r') != std::string::npos) {
+      tmp.reserve(output.size());
+      std::copy_if(output.begin(), output.end(), std::back_inserter(tmp),
+                   [](char c) { return c != '\r'; });
+      folly::split('\n', tmp, lines);
+    } else {
+      folly::split('\n', output, lines);
+    }
 
     if (lines.back().empty()) {
       lines.pop_back();
     }
 
+    std::ostringstream oss;
     bool clear_ctx = true;
 
-    std::lock_guard lock(mx_);
-
-    preamble();
-
     for (auto l : lines) {
-      os_ << prefix << lchar << ' ' << t << ' ' << context << l << suffix
+      oss << prefix << lchar << ' ' << t << ' ' << context << l << suffix
           << newline;
 
       if (clear_ctx) {
@@ -161,11 +231,23 @@ void stream_logger::write(level_type level, const std::string& output,
 
 #if DWARFS_SYMBOLIZE
     for (auto l : st_lines) {
-      os_ << l << newline;
+      oss << l << newline;
     }
 #endif
 
-    postamble();
+    std::lock_guard lock(mx_);
+
+    std::ostringstream oss2;
+
+    preamble(oss2);
+    oss2 << oss.str();
+    postamble(oss2);
+
+    write_nolock(oss2.str());
+  }
+
+  if (level == FATAL) {
+    std::abort();
   }
 }
 
@@ -180,8 +262,7 @@ void stream_logger::set_threshold(level_type threshold) {
 }
 
 std::string get_logger_context(char const* path, int line) {
-  auto base = ::strrchr(path, '/');
-  return fmt::format("[{0}:{1}] ", base ? base + 1 : path, line);
+  return fmt::format("[{0}:{1}] ", basename(path), line);
 }
 
 std::string get_current_time_string() {

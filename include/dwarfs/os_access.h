@@ -21,9 +21,14 @@
 
 #pragma once
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <system_error>
+#include <thread>
 
 #include "dwarfs/file_stat.h"
 
@@ -42,13 +47,26 @@ class os_access {
  public:
   virtual ~os_access() = default;
 
-  virtual std::shared_ptr<dir_reader>
+  virtual std::unique_ptr<dir_reader>
   opendir(std::filesystem::path const& path) const = 0;
   virtual file_stat symlink_info(std::filesystem::path const& path) const = 0;
   virtual std::filesystem::path
   read_symlink(std::filesystem::path const& path) const = 0;
-  virtual std::shared_ptr<mmif>
+  virtual std::unique_ptr<mmif>
+  map_file(std::filesystem::path const& path) const = 0;
+  virtual std::unique_ptr<mmif>
   map_file(std::filesystem::path const& path, size_t size) const = 0;
   virtual int access(std::filesystem::path const& path, int mode) const = 0;
+  virtual std::filesystem::path
+  canonical(std::filesystem::path const& path) const = 0;
+  virtual std::filesystem::path current_path() const = 0;
+  virtual std::optional<std::string> getenv(std::string_view name) const = 0;
+  virtual void
+  thread_set_affinity(std::thread::id tid, std::span<int const> cpus,
+                      std::error_code& ec) const = 0;
+  virtual std::chrono::nanoseconds
+  thread_get_cpu_time(std::thread::id tid, std::error_code& ec) const = 0;
+  virtual std::filesystem::path
+  find_executable(std::filesystem::path const& name) const = 0;
 };
 } // namespace dwarfs

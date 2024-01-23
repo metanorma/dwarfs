@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "dwarfs/compression.h"
+#include "dwarfs/compression_constraints.h"
 
 namespace dwarfs {
 
@@ -47,7 +49,9 @@ class bad_compression_ratio_error : public std::runtime_error {
 
 class block_compressor {
  public:
-  block_compressor(const std::string& spec);
+  block_compressor() = default;
+
+  explicit block_compressor(const std::string& spec);
 
   block_compressor(const block_compressor& bc)
       : impl_(bc.impl_->clone()) {}
@@ -56,14 +60,35 @@ class block_compressor {
   block_compressor& operator=(block_compressor&& rhs) = default;
 
   std::vector<uint8_t> compress(std::vector<uint8_t> const& data) const {
-    return impl_->compress(data);
+    return impl_->compress(data, nullptr);
   }
 
   std::vector<uint8_t> compress(std::vector<uint8_t>&& data) const {
-    return impl_->compress(std::move(data));
+    return impl_->compress(std::move(data), nullptr);
+  }
+
+  std::vector<uint8_t> compress(std::vector<uint8_t> const& data,
+                                std::string const& metadata) const {
+    return impl_->compress(data, &metadata);
+  }
+
+  std::vector<uint8_t>
+  compress(std::vector<uint8_t>&& data, std::string const& metadata) const {
+    return impl_->compress(std::move(data), &metadata);
   }
 
   compression_type type() const { return impl_->type(); }
+
+  std::string describe() const { return impl_->describe(); }
+
+  std::string metadata_requirements() const {
+    return impl_->metadata_requirements();
+  }
+
+  compression_constraints
+  get_compression_constraints(std::string const& metadata) const {
+    return impl_->get_compression_constraints(metadata);
+  }
 
   class impl {
    public:
@@ -72,11 +97,19 @@ class block_compressor {
     virtual std::unique_ptr<impl> clone() const = 0;
 
     virtual std::vector<uint8_t>
-    compress(const std::vector<uint8_t>& data) const = 0;
+    compress(const std::vector<uint8_t>& data,
+             std::string const* metadata) const = 0;
     virtual std::vector<uint8_t>
-    compress(std::vector<uint8_t>&& data) const = 0;
+    compress(std::vector<uint8_t>&& data,
+             std::string const* metadata) const = 0;
 
     virtual compression_type type() const = 0;
+    virtual std::string describe() const = 0;
+
+    virtual std::string metadata_requirements() const = 0;
+
+    virtual compression_constraints
+    get_compression_constraints(std::string const& metadata) const = 0;
   };
 
  private:
@@ -96,6 +129,8 @@ class block_decompressor {
 
   compression_type type() const { return impl_->type(); }
 
+  std::optional<std::string> metadata() const { return impl_->metadata(); }
+
   static std::vector<uint8_t>
   decompress(compression_type type, const uint8_t* data, size_t size) {
     std::vector<uint8_t> target;
@@ -110,6 +145,7 @@ class block_decompressor {
 
     virtual bool decompress_frame(size_t frame_size) = 0;
     virtual size_t uncompressed_size() const = 0;
+    virtual std::optional<std::string> metadata() const = 0;
 
     virtual compression_type type() const = 0;
   };

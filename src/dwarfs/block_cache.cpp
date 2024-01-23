@@ -137,18 +137,19 @@ class block_request_set {
 template <typename LoggerPolicy>
 class block_cache_ final : public block_cache::impl {
  public:
-  block_cache_(logger& lgr, std::shared_ptr<mmif> mm,
+  block_cache_(logger& lgr, os_access const& os, std::shared_ptr<mmif> mm,
                block_cache_options const& options)
       : cache_(0)
       , mm_(std::move(mm))
       , LOG_PROXY_INIT(lgr)
+      , os_{os}
       , options_(options) {
     if (options.init_workers) {
-      wg_ =
-          worker_group("blkcache", std::max(options.num_workers > 0
-                                                ? options.num_workers
-                                                : folly::hardware_concurrency(),
-                                            static_cast<size_t>(1)));
+      wg_ = worker_group(lgr, os_, "blkcache",
+                         std::max(options.num_workers > 0
+                                      ? options.num_workers
+                                      : folly::hardware_concurrency(),
+                                  static_cast<size_t>(1)));
     }
   }
 
@@ -188,25 +189,25 @@ class block_cache_ final : public block_cache::impl {
     // on to a block that has been evicted from the cache and re-insert the
     // block after the request is complete. So it's not a bug to see the
     // number of evicted blocks outgrow the number of created blocks.
-    LOG_INFO << "blocks created: " << blocks_created_.load();
-    LOG_INFO << "blocks evicted: " << blocks_evicted_.load();
-    LOG_INFO << "blocks tidied: " << blocks_tidied_.load();
-    LOG_INFO << "request sets merged: " << sets_merged_.load();
-    LOG_INFO << "total requests: " << range_requests_.load();
-    LOG_INFO << "active hits (fast): " << active_hits_fast_.load();
-    LOG_INFO << "active hits (slow): " << active_hits_slow_.load();
-    LOG_INFO << "cache hits (fast): " << cache_hits_fast_.load();
-    LOG_INFO << "cache hits (slow): " << cache_hits_slow_.load();
+    LOG_VERBOSE << "blocks created: " << blocks_created_.load();
+    LOG_VERBOSE << "blocks evicted: " << blocks_evicted_.load();
+    LOG_VERBOSE << "blocks tidied: " << blocks_tidied_.load();
+    LOG_VERBOSE << "request sets merged: " << sets_merged_.load();
+    LOG_VERBOSE << "total requests: " << range_requests_.load();
+    LOG_VERBOSE << "active hits (fast): " << active_hits_fast_.load();
+    LOG_VERBOSE << "active hits (slow): " << active_hits_slow_.load();
+    LOG_VERBOSE << "cache hits (fast): " << cache_hits_fast_.load();
+    LOG_VERBOSE << "cache hits (slow): " << cache_hits_slow_.load();
 
-    LOG_INFO << "total bytes decompressed: " << total_decompressed_bytes_;
-    LOG_INFO << "average block decompression: "
-             << fmt::format("{:.1f}", avg_decompression) << "%";
+    LOG_VERBOSE << "total bytes decompressed: " << total_decompressed_bytes_;
+    LOG_VERBOSE << "average block decompression: "
+                << fmt::format("{:.1f}", avg_decompression) << "%";
 
-    LOG_INFO << "fast hit rate: " << fmt::format("{:.3f}", fast_hit_rate)
-             << "%";
-    LOG_INFO << "slow hit rate: " << fmt::format("{:.3f}", slow_hit_rate)
-             << "%";
-    LOG_INFO << "miss rate: " << fmt::format("{:.3f}", miss_rate) << "%";
+    LOG_VERBOSE << "fast hit rate: " << fmt::format("{:.3f}", fast_hit_rate)
+                << "%";
+    LOG_VERBOSE << "slow hit rate: " << fmt::format("{:.3f}", slow_hit_rate)
+                << "%";
+    LOG_VERBOSE << "miss rate: " << fmt::format("{:.3f}", miss_rate) << "%";
   }
 
   size_t block_count() const override { return block_.size(); }
@@ -247,7 +248,7 @@ class block_cache_ final : public block_cache::impl {
       wg_.stop();
     }
 
-    wg_ = worker_group("blkcache", num);
+    wg_ = worker_group(LOG_GET_LOGGER, os_, "blkcache", num);
   }
 
   void set_tidy_config(cache_tidy_config const& cfg) override {
@@ -256,6 +257,10 @@ class block_cache_ final : public block_cache::impl {
         stop_tidy_thread();
       }
     } else {
+      if (cfg.interval == std::chrono::milliseconds::zero()) {
+        DWARFS_THROW(runtime_error, "tidy interval is zero");
+      }
+
       std::lock_guard lock(mx_);
 
       tidy_config_ = cfg;
@@ -622,13 +627,15 @@ class block_cache_ final : public block_cache::impl {
   std::vector<fs_section> block_;
   std::shared_ptr<mmif> mm_;
   LOG_PROXY_DECL(LoggerPolicy);
+  os_access const& os_;
   const block_cache_options options_;
   cache_tidy_config tidy_config_;
 };
 
-block_cache::block_cache(logger& lgr, std::shared_ptr<mmif> mm,
+block_cache::block_cache(logger& lgr, os_access const& os,
+                         std::shared_ptr<mmif> mm,
                          const block_cache_options& options)
     : impl_(make_unique_logging_object<impl, block_cache_, logger_policies>(
-          lgr, std::move(mm), options)) {}
+          lgr, os, std::move(mm), options)) {}
 
 } // namespace dwarfs

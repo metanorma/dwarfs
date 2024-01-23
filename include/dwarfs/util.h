@@ -24,16 +24,24 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <span>
 #include <string>
+#include <string_view>
 
 #include "dwarfs/types.h"
 
 namespace dwarfs {
 
+struct iolayer;
+
 std::string time_with_unit(double sec);
+std::string time_with_unit(std::chrono::nanoseconds ns);
 std::string size_with_unit(size_t size);
 size_t parse_size_with_unit(std::string const& str);
 std::chrono::milliseconds parse_time_with_unit(std::string const& str);
+std::chrono::system_clock::time_point parse_time_point(std::string const& str);
+
+file_off_t parse_image_offset(std::string const& str);
 
 inline std::u8string string_to_u8string(std::string const& in) {
   return std::u8string(reinterpret_cast<char8_t const*>(in.data()), in.size());
@@ -52,14 +60,26 @@ inline std::string u8string_to_string(std::string const& in) {
 
 
 std::string sys_string_to_string(sys_string const& in);
+sys_string string_to_sys_string(std::string const& in);
+
+int call_sys_main_iolayer(std::span<std::string_view> args, iolayer const& iol,
+                          int (*main)(int, sys_char**, iolayer const&));
+
+int call_sys_main_iolayer(std::span<std::string> args, iolayer const& iol,
+                          int (*main)(int, sys_char**, iolayer const&));
 
 size_t utf8_display_width(char const* p, size_t len);
 size_t utf8_display_width(std::string const& str);
+void utf8_truncate(std::string& str, size_t len);
 
 void shorten_path_string(std::string& path, char separator, size_t max_len);
 
 std::filesystem::path canonical_path(std::filesystem::path p);
 
 bool getenv_is_enabled(char const* var);
+
+void setup_default_locale();
+
+std::string_view basename(std::string_view path);
 
 } // namespace dwarfs

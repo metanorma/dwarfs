@@ -20,6 +20,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -33,24 +34,34 @@
 #include <vector>
 
 #include <folly/ExceptionString.h>
+#include <folly/system/HardwareConcurrency.h>
 
 #include <fmt/format.h>
 
 #include "dwarfs/block_data.h"
+#include "dwarfs/block_manager.h"
+#include "dwarfs/categorizer.h"
 #include "dwarfs/entry.h"
 #include "dwarfs/error.h"
+#include "dwarfs/features.h"
+#include "dwarfs/file_access.h"
 #include "dwarfs/file_scanner.h"
 #include "dwarfs/filesystem_writer.h"
+#include "dwarfs/fragment_chunkable.h"
 #include "dwarfs/global_entry_data.h"
+#include "dwarfs/history.h"
 #include "dwarfs/inode.h"
 #include "dwarfs/inode_manager.h"
+#include "dwarfs/inode_ordering.h"
 #include "dwarfs/logger.h"
 #include "dwarfs/metadata_v2.h"
+#include "dwarfs/mmif.h"
 #include "dwarfs/options.h"
 #include "dwarfs/os_access.h"
 #include "dwarfs/progress.h"
 #include "dwarfs/scanner.h"
 #include "dwarfs/script.h"
+#include "dwarfs/segmenter_factory.h"
 #include "dwarfs/string_table.h"
 #include "dwarfs/util.h"
 #include "dwarfs/version.h"
@@ -59,6 +70,8 @@
 #include "dwarfs/gen-cpp2/metadata_types.h"
 
 namespace dwarfs {
+
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -79,8 +92,6 @@ class dir_set_inode_visitor : public visitor_base {
     p->sort();
     p->set_inode_num(inode_num_++);
   }
-
-  uint32_t inode_num() const { return inode_num_; }
 
  private:
   uint32_t& inode_num_;
@@ -267,14 +278,15 @@ std::string status_string(progress const& p, size_t width) {
 template <typename LoggerPolicy>
 class scanner_ final : public scanner::impl {
  public:
-  scanner_(logger& lgr, worker_group& wg, const block_manager::config& config,
-           std::shared_ptr<entry_factory> ef, std::shared_ptr<os_access> os,
-           std::shared_ptr<script> scr, const scanner_options& options);
+  scanner_(logger& lgr, worker_group& wg, std::shared_ptr<segmenter_factory> sf,
+           std::shared_ptr<entry_factory> ef,
+           std::shared_ptr<os_access const> os, std::shared_ptr<script> scr,
+           const scanner_options& options);
 
-  void
-  scan(filesystem_writer& fsw, std::filesystem::path const& path,
-       progress& prog,
-       std::optional<std::span<std::filesystem::path const>> list) override;
+  void scan(filesystem_writer& fsw, std::filesystem::path const& path,
+            progress& prog,
+            std::optional<std::span<std::filesystem::path const>> list,
+            std::shared_ptr<file_access const> fa) override;
 
  private:
   std::shared_ptr<entry> scan_tree(std::filesystem::path const& path,
@@ -289,31 +301,29 @@ class scanner_ final : public scanner::impl {
             progress& prog, detail::file_scanner& fs,
             bool debug_filter = false);
 
-  const block_manager::config& cfg_;
-  const scanner_options& options_;
-  std::shared_ptr<entry_factory> entry_;
-  std::shared_ptr<os_access> os_;
-  std::shared_ptr<script> script_;
-  worker_group& wg_;
-  logger& lgr_;
   LOG_PROXY_DECL(LoggerPolicy);
+  worker_group& wg_;
+  scanner_options const& options_;
+  std::shared_ptr<segmenter_factory> segmenter_factory_;
+  std::shared_ptr<entry_factory> entry_factory_;
+  std::shared_ptr<os_access const> os_;
+  std::shared_ptr<script> script_;
 };
 
 template <typename LoggerPolicy>
 scanner_<LoggerPolicy>::scanner_(logger& lgr, worker_group& wg,
-                                 const block_manager::config& cfg,
+                                 std::shared_ptr<segmenter_factory> sf,
                                  std::shared_ptr<entry_factory> ef,
-                                 std::shared_ptr<os_access> os,
+                                 std::shared_ptr<os_access const> os,
                                  std::shared_ptr<script> scr,
                                  const scanner_options& options)
-    : cfg_(cfg)
-    , options_(options)
-    , entry_(std::move(ef))
+    : LOG_PROXY_INIT(lgr)
+    , wg_{wg}
+    , options_{options}
+    , segmenter_factory_{std::move(sf)}
+    , entry_factory_{std::move(ef)}
     , os_(std::move(os))
-    , script_(std::move(scr))
-    , wg_(wg)
-    , lgr_(lgr)
-    , LOG_PROXY_INIT(lgr_) {}
+    , script_(std::move(scr)) {}
 
 template <typename LoggerPolicy>
 std::shared_ptr<entry>
@@ -321,7 +331,7 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
                                   std::shared_ptr<dir> parent, progress& prog,
                                   detail::file_scanner& fs, bool debug_filter) {
   try {
-    auto pe = entry_->create(*os_, name, parent);
+    auto pe = entry_factory_->create(*os_, name, parent);
     bool exclude = false;
 
     if (script_) {
@@ -347,7 +357,7 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
     if (pe) {
       switch (pe->type()) {
       case entry::E_FILE:
-        if (os_->access(pe->fs_path(), R_OK)) {
+        if (pe->size() > 0 && os_->access(pe->fs_path(), R_OK)) {
           LOG_ERROR << "cannot access " << pe->path_as_string()
                     << ", creating empty file";
           pe->override_size(0);
@@ -414,7 +424,7 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
 
     return pe;
   } catch (const std::system_error& e) {
-    LOG_ERROR << "error reading entry: " << e.what();
+    LOG_ERROR << "error reading entry: " << folly::exceptionStr(e);
     prog.errors++;
   }
 
@@ -425,7 +435,7 @@ template <typename LoggerPolicy>
 std::shared_ptr<entry>
 scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
                                   progress& prog, detail::file_scanner& fs) {
-  auto root = entry_->create(*os_, path);
+  auto root = entry_factory_->create(*os_, path);
   bool const debug_filter = options_.debug_filter_function.has_value();
 
   if (root->type() != entry::E_DIR) {
@@ -485,7 +495,7 @@ scanner_<LoggerPolicy>::scan_list(std::filesystem::path const& path,
 
   auto ti = LOG_TIMED_INFO;
 
-  auto root = entry_->create(*os_, path);
+  auto root = entry_factory_->create(*os_, path);
 
   if (root->type() != entry::E_DIR) {
     DWARFS_THROW(runtime_error,
@@ -558,15 +568,16 @@ scanner_<LoggerPolicy>::scan_list(std::filesystem::path const& path,
 template <typename LoggerPolicy>
 void scanner_<LoggerPolicy>::scan(
     filesystem_writer& fsw, const std::filesystem::path& path, progress& prog,
-    std::optional<std::span<std::filesystem::path const>> list) {
+    std::optional<std::span<std::filesystem::path const>> list,
+    std::shared_ptr<file_access const> fa) {
   if (!options_.debug_filter_function) {
     LOG_INFO << "scanning " << path;
   }
 
   prog.set_status_function(status_string);
 
-  inode_manager im(lgr_, prog);
-  detail::file_scanner fs(wg_, *os_, im, options_.inode,
+  inode_manager im(LOG_GET_LOGGER, prog, options_.inode);
+  detail::file_scanner fs(LOG_GET_LOGGER, wg_, *os_, im,
                           options_.file_hash_algorithm, prog);
 
   auto root =
@@ -593,21 +604,42 @@ void scanner_<LoggerPolicy>::scan(
   root->accept(lsiv, true);
 
   LOG_INFO << "waiting for background scanners...";
+
   wg_.wait();
 
-  LOG_INFO << "scanning CPU time: " << time_with_unit(wg_.get_cpu_time());
+  LOG_INFO << "scanning CPU time: "
+           << time_with_unit(wg_.get_cpu_time().value_or(0ns));
 
   LOG_INFO << "finalizing file inodes...";
   uint32_t first_device_inode = first_file_inode;
   fs.finalize(first_device_inode);
+
+  // this must be done after finalizing the inodes since this is when
+  // the file vectors are populated
+  if (im.has_invalid_inodes()) {
+    LOG_INFO << "trying to recover any invalid inodes...";
+    im.try_scan_invalid(wg_, *os_);
+    wg_.wait();
+  }
 
   LOG_INFO << "saved " << size_with_unit(prog.saved_by_deduplication) << " / "
            << size_with_unit(prog.original_size) << " in "
            << prog.duplicate_files << "/" << prog.files_found
            << " duplicate files";
 
+  auto frag_info = im.fragment_category_info();
+
+  if (auto catmgr = options_.inode.categorizer_mgr) {
+    for (auto const& ci : frag_info.info) {
+      LOG_VERBOSE << "found " << ci.fragment_count << " "
+                  << catmgr->category_name(ci.category) << " fragments ("
+                  << size_with_unit(ci.total_size) << ")";
+    }
+  }
+
   global_entry_data ge_data(options_);
   thrift::metadata::metadata mv2;
+  feature_set features;
 
   mv2.symlink_table()->resize(first_file_inode - first_link_inode);
 
@@ -642,50 +674,144 @@ void scanner_<LoggerPolicy>::scan(
     });
   });
 
+  if (auto dumpfile = os_->getenv("DWARFS_DUMP_INODES")) {
+    if (fa) {
+      LOG_VERBOSE << "dumping inodes to " << *dumpfile;
+      std::error_code ec;
+      auto ofs = fa->open_output(*dumpfile, ec);
+      if (ec) {
+        LOG_ERROR << "cannot open '" << *dumpfile << "': " << ec.message();
+      } else {
+        im.dump(ofs->os());
+        ofs->close(ec);
+        if (ec) {
+          LOG_ERROR << "cannot close '" << *dumpfile << "': " << ec.message();
+        }
+      }
+    } else {
+      LOG_ERROR << "cannot dump inodes: no file access";
+    }
+  }
+
   LOG_INFO << "building blocks...";
-  block_manager bm(lgr_, prog, cfg_, os_, fsw);
+
+  // TODO:
+  // - get rid of multiple worker groups
+  // - instead, introduce "batches" to which work can be added, and
+  //   which gets run on a worker groups; each batch keeps track of
+  //   its CPU time and affects thread naming
+
+  auto blockmgr = std::make_shared<block_manager>();
 
   {
-    worker_group blockify("blockify", 1, 1 << 20);
+    size_t const num_threads = options_.num_segmenter_workers;
+    worker_group wg_ordering(LOG_GET_LOGGER, *os_, "ordering", num_threads);
+    worker_group wg_blockify(LOG_GET_LOGGER, *os_, "blockify", num_threads);
 
-    {
-      worker_group ordering("ordering", 1);
+    fsw.configure(frag_info.categories, num_threads);
 
-      ordering.add_job([&] {
-        im.order_inodes(script_, options_.file_order,
-                        [&](std::shared_ptr<inode> const& ino) {
-                          blockify.add_job([&] {
-                            prog.current.store(ino.get());
-                            bm.add_inode(ino);
-                            prog.inodes_written++;
-                          });
-                          auto queued_files = blockify.queue_size();
-                          auto queued_blocks = fsw.queue_fill();
-                          prog.blockify_queue = queued_files;
-                          prog.compress_queue = queued_blocks;
-                          return INT64_C(500) * queued_blocks +
-                                 static_cast<int64_t>(queued_files);
-                        });
+    for (auto category : frag_info.categories) {
+      auto cat_size = frag_info.category_size.at(category);
+      auto catmgr = options_.inode.categorizer_mgr.get();
+      std::string meta;
+
+      if (catmgr) {
+        meta = catmgr->category_metadata(category);
+        if (!meta.empty()) {
+          LOG_VERBOSE << category_prefix(catmgr, category)
+                      << "metadata: " << meta;
+        }
+      }
+
+      auto cc = fsw.get_compression_constraints(category.value(), meta);
+
+      wg_blockify.add_job([this, catmgr, blockmgr, category, cat_size, meta, cc,
+                           &prog, &fsw, &im, &wg_ordering] {
+        auto span = im.ordered_span(category, wg_ordering);
+        auto tv = LOG_CPU_TIMED_VERBOSE;
+
+        auto seg = segmenter_factory_->create(
+            category, cat_size, cc, blockmgr,
+            [category, meta, blockmgr, &fsw](auto block,
+                                             auto logical_block_num) {
+              fsw.write_block(
+                  category, std::move(block),
+                  [blockmgr, logical_block_num,
+                   category](auto physical_block_num) {
+                    blockmgr->set_written_block(logical_block_num,
+                                                physical_block_num,
+                                                category.value());
+                  },
+                  meta);
+            });
+
+        for (auto ino : span) {
+          prog.current.store(ino.get());
+
+          // TODO: factor this code out
+          auto f = ino->any();
+
+          if (auto size = f->size(); size > 0 && !f->is_invalid()) {
+            auto [mm, _, errors] = ino->mmap_any(*os_);
+
+            if (mm) {
+              file_off_t offset{0};
+
+              for (auto& frag : ino->fragments()) {
+                if (frag.category() == category) {
+                  fragment_chunkable fc(*ino, frag, offset, *mm, catmgr);
+                  seg.add_chunkable(fc);
+                  prog.fragments_written++;
+                }
+
+                offset += frag.size();
+              }
+            } else {
+              for (auto& [fp, e] : errors) {
+                LOG_ERROR << "failed to map file " << fp->path_as_string()
+                          << ": " << folly::exceptionStr(e)
+                          << ", creating empty inode";
+                ++prog.errors;
+              }
+              for (auto& frag : ino->fragments()) {
+                if (frag.category() == category) {
+                  prog.fragments_found--;
+                }
+              }
+            }
+          }
+
+          prog.inodes_written++; // TODO: remove?
+        }
+
+        seg.finish();
+        fsw.finish_category(category);
+
+        tv << category_prefix(catmgr, category) << "segmenting finished";
       });
-
-      ordering.wait();
     }
 
     LOG_INFO << "waiting for segmenting/blockifying to finish...";
 
-    blockify.wait();
+    // We must wait for blockify first, since the blockify jobs are what
+    // trigger the ordering jobs.
+    wg_blockify.wait();
+    wg_ordering.wait();
 
-    LOG_INFO << "segmenting/blockifying CPU time: "
-             << time_with_unit(blockify.get_cpu_time());
+    LOG_INFO << "total ordering CPU time: "
+             << time_with_unit(wg_ordering.get_cpu_time().value_or(0ns));
+
+    LOG_INFO << "total segmenting CPU time: "
+             << time_with_unit(wg_blockify.get_cpu_time().value_or(0ns));
   }
 
-  bm.finish_blocks();
+  // seg.finish();
   wg_.wait();
 
   prog.set_status_function([](progress const&, size_t) {
     return "waiting for block compression to finish";
   });
-  prog.sync([&] { prog.current.store(nullptr); });
+  prog.current.store(nullptr);
 
   // this is actually needed
   root->set_name(std::string());
@@ -695,10 +821,20 @@ void scanner_<LoggerPolicy>::scan(
 
   // TODO: we should be able to start this once all blocks have been
   //       submitted for compression
+  mv2.chunks().value().reserve(prog.chunk_count);
   im.for_each_inode_in_order([&](std::shared_ptr<inode> const& ino) {
     DWARFS_NOTHROW(mv2.chunk_table()->at(ino->num())) = mv2.chunks()->size();
-    ino->append_chunks_to(mv2.chunks().value());
+    if (!ino->append_chunks_to(mv2.chunks().value())) {
+      std::ostringstream oss;
+      for (auto fp : ino->all()) {
+        oss << "\n  " << fp->path_as_string();
+      }
+      LOG_ERROR << "inconsistent fragments in inode " << ino->num()
+                << ", the following files will be empty:" << oss.str();
+    }
   });
+
+  blockmgr->map_logical_blocks(mv2.chunks().value());
 
   // insert dummy inode to help determine number of chunks per inode
   DWARFS_NOTHROW(mv2.chunk_table()->at(im.count())) = mv2.chunks()->size();
@@ -778,7 +914,7 @@ void scanner_<LoggerPolicy>::scan(
   mv2.gids() = ge_data.get_gids();
   mv2.modes() = ge_data.get_modes();
   mv2.timestamp_base() = ge_data.get_timestamp_base();
-  mv2.block_size() = UINT32_C(1) << cfg_.block_size_bits;
+  mv2.block_size() = segmenter_factory_->get_block_size();
   mv2.total_fs_size() = prog.original_size;
   mv2.total_hardlink_size() = prog.hardlink_size;
   mv2.options() = fsopts;
@@ -789,10 +925,47 @@ void scanner_<LoggerPolicy>::scan(
   mv2.preferred_path_separator() =
       static_cast<uint32_t>(std::filesystem::path::preferred_separator);
 
+  if (auto catmgr = options_.inode.categorizer_mgr) {
+    std::unordered_map<fragment_category::value_type,
+                       fragment_category::value_type>
+        category_indices;
+    std::vector<std::string> category_names;
+
+    category_indices.reserve(frag_info.info.size());
+    category_names.reserve(frag_info.info.size());
+
+    for (auto const& ci : frag_info.info) {
+      auto [it, inserted] =
+          category_indices.emplace(ci.category, category_names.size());
+      if (inserted) {
+        category_names.emplace_back(catmgr->category_name(ci.category));
+      }
+    }
+
+    auto written_categories = blockmgr->get_written_block_categories();
+
+    std::transform(written_categories.begin(), written_categories.end(),
+                   written_categories.begin(),
+                   [&](auto const& cat) { return category_indices.at(cat); });
+
+    mv2.category_names() = std::move(category_names);
+    mv2.block_categories() = std::move(written_categories);
+  }
+
+  mv2.features() = features.get();
+
   auto [schema, data] = metadata_v2::freeze(mv2);
+
+  LOG_VERBOSE << "uncompressed metadata size: " << size_with_unit(data.size());
 
   fsw.write_metadata_v2_schema(std::make_shared<block_data>(std::move(schema)));
   fsw.write_metadata_v2(std::make_shared<block_data>(std::move(data)));
+
+  if (options_.enable_history) {
+    history hist(options_.history);
+    hist.append(options_.command_line_arguments);
+    fsw.write_history(std::make_shared<block_data>(hist.serialize()));
+  }
 
   LOG_INFO << "waiting for compression to finish...";
 
@@ -805,12 +978,12 @@ void scanner_<LoggerPolicy>::scan(
 }
 
 scanner::scanner(logger& lgr, worker_group& wg,
-                 const block_manager::config& cfg,
+                 std::shared_ptr<segmenter_factory> sf,
                  std::shared_ptr<entry_factory> ef,
-                 std::shared_ptr<os_access> os, std::shared_ptr<script> scr,
-                 const scanner_options& options)
+                 std::shared_ptr<os_access const> os,
+                 std::shared_ptr<script> scr, const scanner_options& options)
     : impl_(make_unique_logging_object<impl, scanner_, logger_policies>(
-          lgr, wg, cfg, std::move(ef), std::move(os), std::move(scr),
+          lgr, wg, std::move(sf), std::move(ef), std::move(os), std::move(scr),
           options)) {}
 
 } // namespace dwarfs

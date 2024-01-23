@@ -21,6 +21,11 @@
 
 #pragma once
 
+#include <iosfwd>
+#include <span>
+#include <string>
+#include <string_view>
+
 #include "dwarfs/types.h"
 
 #ifdef _WIN32
@@ -31,10 +36,31 @@
 
 namespace dwarfs {
 
+struct iolayer;
+
+int mkdwarfs_main(std::span<std::string> args, iolayer const& iol);
+int mkdwarfs_main(std::span<std::string_view> args, iolayer const& iol);
+int mkdwarfs_main(int argc, sys_char** argv, iolayer const& iol);
 int mkdwarfs_main(int argc, sys_char** argv);
+
+int dwarfsck_main(std::span<std::string> args, iolayer const& iol);
+int dwarfsck_main(std::span<std::string_view> args, iolayer const& iol);
+int dwarfsck_main(int argc, sys_char** argv, iolayer const& iol);
 int dwarfsck_main(int argc, sys_char** argv);
+
+int dwarfsextract_main(std::span<std::string> args, iolayer const& iol);
+int dwarfsextract_main(std::span<std::string_view> args, iolayer const& iol);
+int dwarfsextract_main(int argc, sys_char** argv, iolayer const& iol);
 int dwarfsextract_main(int argc, sys_char** argv);
+
+int dwarfsbench_main(std::span<std::string> args, iolayer const& iol);
+int dwarfsbench_main(std::span<std::string_view> args, iolayer const& iol);
+int dwarfsbench_main(int argc, sys_char** argv, iolayer const& iol);
 int dwarfsbench_main(int argc, sys_char** argv);
+
+int dwarfs_main(std::span<std::string> args, iolayer const& iol);
+int dwarfs_main(std::span<std::string_view> args, iolayer const& iol);
+int dwarfs_main(int argc, sys_char** argv, iolayer const& iol);
 int dwarfs_main(int argc, sys_char** argv);
 
 } // namespace dwarfs

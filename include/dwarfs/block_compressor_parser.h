@@ -21,34 +21,17 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <mutex>
+#include <string>
+#include <string_view>
+
+#include "dwarfs/block_compressor.h"
 
 namespace dwarfs {
 
-class semaphore {
+struct block_compressor_parser {
  public:
-  semaphore(int count = 0)
-      : count_{count} {}
-
-  void release() {
-    std::unique_lock lock(mx_);
-    ++count_;
-    cv_.notify_one();
-  }
-
-  void acquire() {
-    std::unique_lock lock(mx_);
-    while (count_ == 0) {
-      cv_.wait(lock);
-    }
-    --count_;
-  }
-
- private:
-  std::mutex mx_;
-  std::condition_variable cv_;
-  int count_;
+  block_compressor parse(std::string_view arg) const;
+  std::string to_string(block_compressor const& opts) const;
 };
 
 } // namespace dwarfs

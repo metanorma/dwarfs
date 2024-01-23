@@ -19,6 +19,7 @@
  * along with dwarfs.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -26,12 +27,14 @@
 #include <tuple>
 #include <vector>
 
+#include "dwarfs/error.h"
 #include "dwarfs/offset_cache.h"
+#include "dwarfs/options.h"
 #include "dwarfs/util.h"
 
 using namespace dwarfs;
 
-TEST(utf8_display_width, basic) {
+TEST(utils, utf8_display_width) {
   EXPECT_EQ(0, utf8_display_width(""));
   EXPECT_EQ(1, utf8_display_width(u8string_to_string(u8"a")));
   EXPECT_EQ(5, utf8_display_width(u8string_to_string(u8"abcde")));
@@ -45,7 +48,35 @@ TEST(utf8_display_width, basic) {
                     u8"unicode/我爱你/☀️ Sun/Γειά σας/مرحبًا/⚽️/Карибського")));
 }
 
-TEST(shorten_path, string_ascii) {
+TEST(utils, uft8_truncate) {
+  auto u8trunc = [](std::u8string str, size_t len) {
+    auto tmp = u8string_to_string(str);
+    utf8_truncate(tmp, len);
+    return string_to_u8string(tmp);
+  };
+
+  // -----------------123456789012345--
+  auto const str = u8"我爱你/مرحبًا/⚽️";
+
+  EXPECT_EQ(str, u8trunc(str, 15));
+  // ----------123456789012345--
+  EXPECT_EQ(u8"我爱你/مرحبًا/", u8trunc(str, 14));
+  EXPECT_EQ(u8"我爱你/مرحبًا/", u8trunc(str, 13));
+  EXPECT_EQ(u8"我爱你/مرحبًا", u8trunc(str, 12));
+  EXPECT_EQ(u8"我爱你/مرحبً", u8trunc(str, 11));
+  EXPECT_EQ(u8"我爱你/مرح", u8trunc(str, 10));
+  EXPECT_EQ(u8"我爱你/مر", u8trunc(str, 9));
+  EXPECT_EQ(u8"我爱你/م", u8trunc(str, 8));
+  EXPECT_EQ(u8"我爱你/", u8trunc(str, 7));
+  EXPECT_EQ(u8"我爱你", u8trunc(str, 6));
+  EXPECT_EQ(u8"我爱", u8trunc(str, 5));
+  EXPECT_EQ(u8"我爱", u8trunc(str, 4));
+  EXPECT_EQ(u8"我", u8trunc(str, 3));
+  EXPECT_EQ(u8"我", u8trunc(str, 2));
+  EXPECT_EQ(u8"", u8trunc(str, 1));
+}
+
+TEST(utils, shorten_path_ascii) {
   std::string const orig =
       "/foo/bar/home/bla/mnt/doc/html/boost_asio/reference/"
       "async_result_lt__basic_yield_context_lt__Executor__gt__comma__Signature_"
@@ -94,12 +125,12 @@ TEST(shorten_path, string_ascii) {
     for (size_t max_len = 0; max_len < expected.size(); ++max_len) {
       std::string path = "/aa/bb/cc/dd/ee";
       shorten_path_string(path, '/', max_len);
-      EXPECT_EQ(expected[max_len], path);
+      EXPECT_EQ(expected[max_len], path) << "[" << max_len << "]" << path;
     }
   }
 }
 
-TEST(shorten_path, string_utf8) {
+TEST(utils, shorten_path_utf8) {
   std::u8string const orig_u8 =
       u8"/unicode/我爱你/☀️ Sun/Γειά σας/مرحبًا/⚽️/Карибського";
   std::string const orig = u8string_to_string(orig_u8);
@@ -222,7 +253,7 @@ find_file_position(cache_type::inode_type const inode,
 
 } // namespace
 
-TEST(offset_cache, basic) {
+TEST(utils, offset_cache_basic) {
   cache_type cache(4);
 
   size_t total_ref_lookups = 0;
@@ -276,7 +307,7 @@ TEST(offset_cache, basic) {
   }
 }
 
-TEST(offset_cache, prefill) {
+TEST(utils, offset_cache_prefill) {
   cache_type prefilled_cache(4);
 
   auto [prefill_ix, prefill_off, prefill_lookups] = find_file_position(
@@ -285,4 +316,80 @@ TEST(offset_cache, prefill) {
   EXPECT_EQ(test_chunks.size(), prefill_lookups);
   EXPECT_EQ(test_chunks.size() - 1, prefill_ix);
   EXPECT_EQ(test_chunks.back() - 1, prefill_off);
+}
+
+TEST(utils, parse_time_with_unit) {
+  using namespace std::chrono_literals;
+  EXPECT_EQ(3ms, parse_time_with_unit("3ms"));
+  EXPECT_EQ(4s, parse_time_with_unit("4s"));
+  EXPECT_EQ(5s, parse_time_with_unit("5"));
+  EXPECT_EQ(6min, parse_time_with_unit("6m"));
+  EXPECT_EQ(7h, parse_time_with_unit("7h"));
+  EXPECT_THROW(parse_time_with_unit("8y"), dwarfs::runtime_error);
+  EXPECT_THROW(parse_time_with_unit("8su"), dwarfs::runtime_error);
+  EXPECT_THROW(parse_time_with_unit("8mss"), dwarfs::runtime_error);
+  EXPECT_THROW(parse_time_with_unit("ms"), dwarfs::runtime_error);
+}
+
+TEST(utils, parse_size_with_unit) {
+  EXPECT_EQ(static_cast<size_t>(2), parse_size_with_unit("2"));
+  EXPECT_EQ(static_cast<size_t>(3) * 1024, parse_size_with_unit("3k"));
+  EXPECT_EQ(static_cast<size_t>(4) * 1024 * 1024, parse_size_with_unit("4m"));
+  EXPECT_EQ(static_cast<size_t>(5) * 1024 * 1024 * 1024,
+            parse_size_with_unit("5g"));
+  EXPECT_EQ(static_cast<size_t>(6) * 1024 * 1024 * 1024 * 1024,
+            parse_size_with_unit("6t"));
+  EXPECT_EQ(static_cast<size_t>(1001) * 1024, parse_size_with_unit("1001K"));
+  EXPECT_EQ(static_cast<size_t>(1002) * 1024 * 1024,
+            parse_size_with_unit("1002M"));
+  EXPECT_EQ(static_cast<size_t>(1003) * 1024 * 1024 * 1024,
+            parse_size_with_unit("1003G"));
+  EXPECT_EQ(static_cast<size_t>(1004) * 1024 * 1024 * 1024 * 1024,
+            parse_size_with_unit("1004T"));
+  EXPECT_THROW(parse_size_with_unit("7y"), dwarfs::runtime_error);
+  EXPECT_THROW(parse_size_with_unit("7tb"), dwarfs::runtime_error);
+  EXPECT_THROW(parse_size_with_unit("asd"), dwarfs::runtime_error);
+}
+
+TEST(utils, parse_time_point) {
+  using namespace std::chrono_literals;
+  using std::chrono::sys_days;
+
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01T"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01 00:00:00"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01T00:00:00"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01 00:00"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("2020-01-01T00:00"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("20200101T000000"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("20200101T0000"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1}, parse_time_point("20200101T"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1} + 1h + 2min + 3s,
+            parse_time_point("2020-01-01 01:02:03"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1} + 1h + 2min,
+            parse_time_point("2020-01-01 01:02"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1} + 1h + 2min + 3s + 123ms,
+            parse_time_point("2020-01-01 01:02:03.123"));
+  EXPECT_EQ(sys_days{2020y / 1 / 1} + 1h + 2min + 3s + 123ms,
+            parse_time_point("20200101T010203.123"));
+
+  EXPECT_THAT([] { parse_time_point("InVaLiD"); },
+              ::testing::ThrowsMessage<dwarfs::runtime_error>(
+                  ::testing::HasSubstr("cannot parse time point")));
+  EXPECT_THAT([] { parse_time_point("2020-01-01 01:02x"); },
+              ::testing::ThrowsMessage<dwarfs::runtime_error>(
+                  ::testing::HasSubstr("cannot parse time point")));
+}
+
+TEST(utils, parse_image_offset) {
+  EXPECT_EQ(0, parse_image_offset("0"));
+  EXPECT_EQ(1, parse_image_offset("1"));
+  EXPECT_EQ(1024, parse_image_offset("1024"));
+  EXPECT_EQ(filesystem_options::IMAGE_OFFSET_AUTO, parse_image_offset("auto"));
+  EXPECT_THAT([] { parse_image_offset("-1"); },
+              ::testing::ThrowsMessage<dwarfs::runtime_error>(
+                  ::testing::HasSubstr("image offset must be positive")));
+  EXPECT_THAT([] { parse_image_offset("asd"); },
+              ::testing::ThrowsMessage<dwarfs::runtime_error>(
+                  ::testing::HasSubstr("failed to parse image offset")));
 }

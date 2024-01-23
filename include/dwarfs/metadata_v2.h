@@ -53,17 +53,24 @@ class metadata;
 class metadata_v2 {
  public:
   metadata_v2() = default;
+  metadata_v2(metadata_v2&&) = default;
+  metadata_v2& operator=(metadata_v2&&) = default;
 
   metadata_v2(logger& lgr, std::span<uint8_t const> schema,
               std::span<uint8_t const> data, metadata_options const& options,
               int inode_offset = 0, bool force_consistency_check = false);
 
-  metadata_v2& operator=(metadata_v2&&) = default;
+  void check_consistency() const { impl_->check_consistency(); }
 
   void
   dump(std::ostream& os, int detail_level, filesystem_info const& fsinfo,
        std::function<void(const std::string&, uint32_t)> const& icb) const {
     impl_->dump(os, detail_level, fsinfo, icb);
+  }
+
+  folly::dynamic
+  info_as_dynamic(int detail_level, filesystem_info const& fsinfo) const {
+    return impl_->info_as_dynamic(detail_level, fsinfo);
   }
 
   folly::dynamic as_dynamic() const { return impl_->as_dynamic(); }
@@ -73,8 +80,6 @@ class metadata_v2 {
   }
 
   size_t size() const { return impl_->size(); }
-
-  bool empty() const { return !impl_ || impl_->empty(); }
 
   void walk(std::function<void(dir_entry_view)> const& func) const {
     impl_->walk(func);
@@ -134,6 +139,18 @@ class metadata_v2 {
 
   bool has_symlinks() const { return impl_->has_symlinks(); }
 
+  folly::dynamic get_inode_info(inode_view iv) const {
+    return impl_->get_inode_info(iv);
+  }
+
+  std::optional<std::string> get_block_category(size_t block_number) const {
+    return impl_->get_block_category(block_number);
+  }
+
+  std::vector<std::string> get_all_block_categories() const {
+    return impl_->get_all_block_categories();
+  }
+
   static std::pair<std::vector<uint8_t>, std::vector<uint8_t>>
   freeze(const thrift::metadata::metadata& data);
 
@@ -141,15 +158,19 @@ class metadata_v2 {
    public:
     virtual ~impl() = default;
 
+    virtual void check_consistency() const = 0;
+
     virtual void dump(
         std::ostream& os, int detail_level, filesystem_info const& fsinfo,
         std::function<void(const std::string&, uint32_t)> const& icb) const = 0;
+
+    virtual folly::dynamic
+    info_as_dynamic(int detail_level, filesystem_info const& fsinfo) const = 0;
 
     virtual folly::dynamic as_dynamic() const = 0;
     virtual std::string serialize_as_json(bool simple) const = 0;
 
     virtual size_t size() const = 0;
-    virtual bool empty() const = 0;
 
     virtual void
     walk(std::function<void(dir_entry_view)> const& func) const = 0;
@@ -188,6 +209,13 @@ class metadata_v2 {
     virtual size_t block_size() const = 0;
 
     virtual bool has_symlinks() const = 0;
+
+    virtual folly::dynamic get_inode_info(inode_view iv) const = 0;
+
+    virtual std::optional<std::string>
+    get_block_category(size_t block_number) const = 0;
+
+    virtual std::vector<std::string> get_all_block_categories() const = 0;
   };
 
  private:

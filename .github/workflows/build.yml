@@ -57,16 +57,41 @@ jobs:
         shell: cmd
         run: |
           cmake --build ${{ runner.temp }}\build --target package
+        if: matrix.build_mode == 'Release'
 
       - name: Compress Universal Binary
         shell: cmd
         run: |
           cmake --build ${{ runner.temp }}\build --target universal_upx
+        if: matrix.build_mode == 'Release'
 
       - name: Copy Artifacts
         shell: cmd
         run: |
           cmake --build ${{ runner.temp }}\build --target copy_artifacts
+        if: matrix.build_mode == 'Release'
+
+      - name: Prepare Artifact Upload
+        shell: cmd
+        run: cat ${{ runner.temp }}\build\artifacts.env >> %GITHUB_ENV%
+        if: matrix.build_mode == 'Release'
+
+      - name: Upload Binary Tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.binary_tarball }}
+          path: ${{ runner.temp }}\build\${{ env.binary_tarball }}
+          if-no-files-found: error
+          compression-level: 0
+        if: matrix.build_mode == 'Release'
+
+      - name: Upload Universal Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.universal_binary }}
+          path: ${{ runner.temp }}\build\${{ env.universal_binary }}
+          if-no-files-found: error
+          compression-level: 0
         if: matrix.build_mode == 'Release'
 
   linux:
@@ -80,8 +105,12 @@ jobs:
           - gcc-release-ninja
           - oldgcc-debug-make
           - clang-release-ninja
+          - gcc-release-ninja-static
+          - gcc-release-ninja-O2-static
           - clang-release-ninja-static
-          - oldclang-debug-make
+          - clang-release-ninja-O2-static
+          - clang-reldbg-ninja-static
+          - clang-debug-ninja-static
         include:
           - arch: amd64
             build_type: clang-asan-ninja
@@ -90,7 +119,11 @@ jobs:
           - arch: amd64
             build_type: clang-ubsan-ninja
           - arch: amd64
+            build_type: clang-coverage-ninja
+          - arch: arm64v8
             build_type: gcc-debug-noperfmon-ninja
+          - arch: arm64v8
+            build_type: oldclang-debug-make
 
     runs-on:
       - self-hosted
@@ -118,10 +151,51 @@ jobs:
           docker run --rm \
             --cap-add SYS_ADMIN --device /dev/fuse --privileged \
             --mount type=bind,source=${GITHUB_WORKSPACE},target=/workspace,readonly \
+            --mount type=bind,source=${{ runner.temp }},target=/tmp-runner \
             --mount type=bind,source=/home/mhx/github-ccache,target=/ccache \
             --mount type=bind,source=/mnt/opensource/artifacts/dwarfs,target=/artifacts \
             --env BUILD_TYPE=${{ matrix.build_type }} \
             --env BUILD_ARCH=${{ matrix.arch }} \
             --env GITHUB_REF_NAME \
             --env GITHUB_REF_TYPE \
+            --env GITHUB_RUN_ID \
+            --env GITHUB_RUN_NUMBER \
+            --env GITHUB_RUN_ATTEMPT \
             dwarfs-linux-build
+
+      - name: List Coverage Files
+        id: coverage-files
+        if: matrix.build_type == 'clang-coverage-ninja'
+        run: |
+          files=$(find ${{ runner.temp }}/coverage -type f | paste -d, -s)
+          echo "list=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Coverage Data
+        if: matrix.build_type == 'clang-coverage-ninja'
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ${{ steps.coverage-files.outputs.list }}
+          fail_ci_if_error: true
+
+      - name: Prepare Artifact Upload
+        run: cat ${{ runner.temp }}/artifacts.env >> $GITHUB_ENV
+        if: ${{ endsWith(matrix.build_type, '-static') }}
+
+      - name: Upload Binary Tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.binary_tarball }}
+          path: ${{ runner.temp }}/artifacts/${{ env.binary_tarball }}
+          if-no-files-found: error
+          compression-level: 0
+        if: ${{ endsWith(matrix.build_type, '-static') }}
+
+      - name: Upload Universal Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.universal_binary }}
+          path: ${{ runner.temp }}/artifacts/${{ env.universal_binary }}
+          if-no-files-found: error
+          compression-level: 0
+        if: ${{ endsWith(matrix.build_type, '-static') }}

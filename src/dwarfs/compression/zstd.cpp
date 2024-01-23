@@ -29,6 +29,7 @@
 #include "dwarfs/error.h"
 #include "dwarfs/fstypes.h"
 #include "dwarfs/option_map.h"
+#include "dwarfs/zstd_context_manager.h"
 
 #if ZSTD_VERSION_MAJOR > 1 ||                                                  \
     (ZSTD_VERSION_MAJOR == 1 && ZSTD_VERSION_MINOR >= 4)
@@ -44,104 +45,59 @@ namespace {
 class zstd_block_compressor final : public block_compressor::impl {
  public:
   explicit zstd_block_compressor(int level)
-      : ctxmgr_(get_context_manager())
-      , level_(level) {}
+      : ctxmgr_{get_context_manager()}
+      , level_{level} {}
 
-  zstd_block_compressor(const zstd_block_compressor& rhs)
-      : level_(rhs.level_) {}
+  zstd_block_compressor(const zstd_block_compressor& rhs) = default;
 
   std::unique_ptr<block_compressor::impl> clone() const override {
     return std::make_unique<zstd_block_compressor>(*this);
   }
 
-  std::vector<uint8_t>
-  compress(const std::vector<uint8_t>& data) const override;
+  std::vector<uint8_t> compress(const std::vector<uint8_t>& data,
+                                std::string const* metadata) const override;
 
-  std::vector<uint8_t> compress(std::vector<uint8_t>&& data) const override {
-    return compress(data);
+  std::vector<uint8_t> compress(std::vector<uint8_t>&& data,
+                                std::string const* metadata) const override {
+    return compress(data, std::move(metadata));
   }
 
   compression_type type() const override { return compression_type::ZSTD; }
 
+  std::string describe() const override {
+    return fmt::format("zstd [level={}]", level_);
+  }
+
+  std::string metadata_requirements() const override { return std::string(); }
+
+  compression_constraints
+  get_compression_constraints(std::string const&) const override {
+    return compression_constraints();
+  }
+
  private:
-  class scoped_context;
-
-  class context_manager {
-   public:
-    context_manager() = default;
-
-    ~context_manager() {
-      for (auto ctx : ctx_) {
-        ZSTD_freeCCtx(ctx);
-      }
-    }
-
-   private:
-    friend class scoped_context;
-
-    ZSTD_CCtx* acquire() {
-      std::lock_guard lock(mx_);
-      if (ctx_.empty()) {
-        return ZSTD_createCCtx();
-      }
-      auto ctx = ctx_.back();
-      ctx_.pop_back();
-      return ctx;
-    }
-
-    void release(ZSTD_CCtx* ctx) {
-      std::lock_guard lock(mx_);
-      ctx_.push_back(ctx);
-    }
-
-    std::mutex mx_;
-    std::vector<ZSTD_CCtx*> ctx_;
-  };
-
-  class scoped_context {
-   public:
-    explicit scoped_context(context_manager& mgr)
-        : mgr_{&mgr}
-        , ctx_{mgr_->acquire()} {}
-    ~scoped_context() { mgr_->release(ctx_); }
-
-    scoped_context(scoped_context const&) = delete;
-    scoped_context(scoped_context&&) = default;
-    scoped_context& operator=(scoped_context const&) = delete;
-    scoped_context& operator=(scoped_context&&) = default;
-
-    ZSTD_CCtx* get() const { return ctx_; }
-
-   private:
-    context_manager* mgr_;
-    ZSTD_CCtx* ctx_;
-  };
-
-  static std::shared_ptr<context_manager> get_context_manager() {
+  static std::shared_ptr<zstd_context_manager> get_context_manager() {
     std::lock_guard lock(s_mx);
     if (auto mgr = s_ctxmgr.lock()) {
       return mgr;
     }
-    auto mgr = std::make_shared<context_manager>();
+    auto mgr = std::make_shared<zstd_context_manager>();
     s_ctxmgr = mgr;
     return mgr;
   }
 
-  static std::mutex s_mx;
-  static std::weak_ptr<context_manager> s_ctxmgr;
+  static inline std::mutex s_mx;
+  static inline std::weak_ptr<zstd_context_manager> s_ctxmgr;
 
-  std::shared_ptr<context_manager> ctxmgr_;
+  std::shared_ptr<zstd_context_manager> ctxmgr_;
   const int level_;
 };
 
-std::mutex zstd_block_compressor::s_mx;
-std::weak_ptr<zstd_block_compressor::context_manager>
-    zstd_block_compressor::s_ctxmgr;
-
 std::vector<uint8_t>
-zstd_block_compressor::compress(const std::vector<uint8_t>& data) const {
+zstd_block_compressor::compress(const std::vector<uint8_t>& data,
+                                std::string const* /*metadata*/) const {
   std::vector<uint8_t> compressed(ZSTD_compressBound(data.size()));
-  scoped_context ctx(*ctxmgr_);
+  auto ctx = ctxmgr_->make_context();
   auto size = ZSTD_compressCCtx(ctx.get(), compressed.data(), compressed.size(),
                                 data.data(), data.size(), level_);
   if (ZSTD_isError(size)) {
@@ -189,6 +145,8 @@ class zstd_block_decompressor final : public block_decompressor::impl {
 
   compression_type type() const override { return compression_type::ZSTD; }
 
+  std::optional<std::string> metadata() const override { return std::nullopt; }
+
   bool decompress_frame(size_t /*frame_size*/) override {
     if (!error_.empty()) {
       DWARFS_THROW(runtime_error, error_);
@@ -225,7 +183,11 @@ class zstd_compression_factory : public compression_factory {
 
   std::string_view name() const override { return "zstd"; }
 
-  std::string_view description() const override { return "ZSTD compression"; }
+  std::string_view description() const override {
+    static std::string const s_desc{
+        fmt::format("ZSTD compression (libzstd {})", ::ZSTD_versionString())};
+    return s_desc;
+  }
 
   std::vector<std::string> const& options() const override { return options_; }
 

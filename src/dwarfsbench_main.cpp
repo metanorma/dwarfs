@@ -29,6 +29,7 @@
 #include "dwarfs/file_stat.h"
 #include "dwarfs/filesystem_v2.h"
 #include "dwarfs/fstypes.h"
+#include "dwarfs/iolayer.h"
 #include "dwarfs/logger.h"
 #include "dwarfs/mmap.h"
 #include "dwarfs/options.h"
@@ -41,9 +42,9 @@ namespace po = boost::program_options;
 
 namespace dwarfs {
 
-int dwarfsbench_main(int argc, sys_char** argv) {
-  std::string filesystem, cache_size_str, lock_mode_str, decompress_ratio_str,
-      log_level;
+int dwarfsbench_main(int argc, sys_char** argv, iolayer const& iol) {
+  std::string filesystem, cache_size_str, lock_mode_str, decompress_ratio_str;
+  logger_options logopts;
   size_t num_workers;
   size_t num_readers;
 
@@ -68,12 +69,10 @@ int dwarfsbench_main(int argc, sys_char** argv) {
     ("decompress-ratio,r",
         po::value<std::string>(&decompress_ratio_str)->default_value("0.8"),
         "block cache size")
-    ("log-level,l",
-        po::value<std::string>(&log_level)->default_value("info"),
-        "log level (error, warn, info, debug, trace)")
-    ("help,h",
-        "output help message and exit");
+    ;
   // clang-format on
+
+  add_common_options(opts, logopts);
 
   po::variables_map vm;
 
@@ -81,17 +80,17 @@ int dwarfsbench_main(int argc, sys_char** argv) {
     po::store(po::parse_command_line(argc, argv, opts), vm);
     po::notify(vm);
   } catch (po::error const& e) {
-    std::cerr << "error: " << e.what() << "\n";
+    iol.err << "error: " << e.what() << "\n";
     return 1;
   }
 
   if (vm.count("help") or !vm.count("filesystem")) {
-    std::cout << tool_header("dwarfsbench") << opts << "\n";
+    iol.out << tool_header("dwarfsbench") << opts << "\n";
     return 0;
   }
 
   try {
-    stream_logger lgr(std::cerr, logger::parse_level(log_level));
+    stream_logger lgr(iol.term, iol.err, logopts);
     filesystem_options fsopts;
 
     fsopts.lock_mode = parse_mlock_mode(lock_mode_str);
@@ -100,15 +99,15 @@ int dwarfsbench_main(int argc, sys_char** argv) {
     fsopts.block_cache.decompress_ratio =
         folly::to<double>(decompress_ratio_str);
 
-    dwarfs::filesystem_v2 fs(lgr, std::make_shared<dwarfs::mmap>(filesystem),
-                             fsopts);
+    dwarfs::filesystem_v2 fs(
+        lgr, *iol.os, std::make_shared<dwarfs::mmap>(filesystem), fsopts);
 
-    worker_group wg("reader", num_readers);
+    worker_group wg(lgr, *iol.os, "reader", num_readers);
 
     fs.walk([&](auto entry) {
       auto inode_data = entry.inode();
       if (inode_data.is_regular_file()) {
-        wg.add_job([&fs, inode_data] {
+        wg.add_job([&fs, &iol, inode_data] {
           try {
             file_stat stbuf;
             if (fs.getattr(inode_data, &stbuf) == 0) {
@@ -116,11 +115,11 @@ int dwarfsbench_main(int argc, sys_char** argv) {
               int fh = fs.open(inode_data);
               fs.read(fh, buf.data(), buf.size());
             }
-          } catch (runtime_error const& e) {
-            std::cerr << "error: " << e.what() << "\n";
+          } catch (std::exception const& e) {
+            iol.err << "error: " << folly::exceptionStr(e) << "\n";
           } catch (...) {
-            std::cerr << "error: "
-                      << folly::exceptionStr(std::current_exception()) << "\n";
+            iol.err << "error: "
+                    << folly::exceptionStr(std::current_exception()) << "\n";
             dump_exceptions();
           }
         });
@@ -128,12 +127,24 @@ int dwarfsbench_main(int argc, sys_char** argv) {
     });
 
     wg.wait();
-  } catch (runtime_error const& e) {
-    std::cerr << "error: " << e.what() << "\n";
+  } catch (std::exception const& e) {
+    iol.err << "error: " << folly::exceptionStr(e) << "\n";
     return 1;
   }
 
   return 0;
+}
+
+int dwarfsbench_main(int argc, sys_char** argv) {
+  return dwarfsbench_main(argc, argv, iolayer::system_default());
+}
+
+int dwarfsbench_main(std::span<std::string> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, dwarfsbench_main);
+}
+
+int dwarfsbench_main(std::span<std::string_view> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, dwarfsbench_main);
 }
 
 } // namespace dwarfs

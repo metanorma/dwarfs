@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace dwarfs {
@@ -31,6 +32,8 @@ class block_data {
   block_data() = default;
   explicit block_data(std::vector<uint8_t>&& vec)
       : vec_{std::move(vec)} {}
+  explicit block_data(std::string_view str)
+      : vec_{str.begin(), str.end()} {}
 
   std::vector<uint8_t> const& vec() const { return vec_; }
   std::vector<uint8_t>& vec() { return vec_; }

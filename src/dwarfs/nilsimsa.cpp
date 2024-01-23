@@ -27,7 +27,7 @@ namespace dwarfs {
 namespace {
 
 // Nilsimsa transition table
-constexpr std::array<uint8_t, 256> TT53{
+constexpr std::array<uint8_t, 256> const TT53{
     {0x02, 0xD6, 0x9E, 0x6F, 0xF9, 0x1D, 0x04, 0xAB, 0xD0, 0x22, 0x16, 0x1F,
      0xD8, 0x73, 0xA1, 0xAC, 0x3B, 0x70, 0x62, 0x96, 0x1E, 0x6E, 0x8F, 0x39,
      0x9D, 0x05, 0x14, 0x4A, 0xA6, 0xBE, 0xAE, 0x0E, 0xCF, 0xB9, 0x9C, 0x9A,
@@ -51,7 +51,7 @@ constexpr std::array<uint8_t, 256> TT53{
      0xF1, 0xCD, 0xE4, 0x6A, 0xE7, 0xA9, 0xFD, 0xC4, 0x37, 0xC8, 0xD2, 0xF6,
      0xDF, 0x58, 0x72, 0x4E}};
 
-uint8_t tran3(uint8_t a, uint8_t b, uint8_t c, uint8_t n) {
+constexpr inline uint8_t tran3(uint8_t a, uint8_t b, uint8_t c, uint8_t n) {
   return ((TT53[(a + n) & 0xFF] ^ TT53[b] * (n + n + 1)) + TT53[c ^ TT53[n]]);
 }
 
@@ -59,10 +59,10 @@ uint8_t tran3(uint8_t a, uint8_t b, uint8_t c, uint8_t n) {
 
 class nilsimsa::impl {
  public:
-  impl() { acc_.fill(0); }
+  impl() = default;
 
   void update(uint8_t const* data, size_t size) {
-    if (DWARFS_UNLIKELY(size_ < 4)) {
+    if (size_ < 4) [[unlikely]] {
       size_t n = std::min(size, 4 - size_);
       update_slow(data, n);
       data += n;
@@ -98,13 +98,13 @@ class nilsimsa::impl {
 
  private:
   void update_slow(uint8_t const* data, size_t size) {
-    uint_fast8_t w1 = w_[0];
-    uint_fast8_t w2 = w_[1];
-    uint_fast8_t w3 = w_[2];
-    uint_fast8_t w4 = w_[3];
+    uint8_t w1 = w_[0];
+    uint8_t w2 = w_[1];
+    uint8_t w3 = w_[2];
+    uint8_t w4 = w_[3];
 
     for (size_t i = 0; i < size; ++i) {
-      uint_fast8_t w0 = data[i];
+      uint8_t w0 = data[i];
 
       if (size_ + i > 1) {
         ++acc_[tran3(w0, w1, w2, 0)];
@@ -137,48 +137,43 @@ class nilsimsa::impl {
     size_ += size;
   }
 
-#define DWARFS_NILSIMSA_UPDATE_FAST_IMPL                                       \
-  void update_fast(uint8_t const* data, size_t size) {                         \
-    uint8_t w1 = w_[0];                                                        \
-    uint8_t w2 = w_[1];                                                        \
-    uint8_t w3 = w_[2];                                                        \
-    uint8_t w4 = w_[3];                                                        \
-                                                                               \
-    for (size_t i = 0; i < size; ++i) {                                        \
-      uint8_t w0 = data[i];                                                    \
-                                                                               \
-      ++acc_[tran3(w0, w1, w2, 0)];                                            \
-      ++acc_[tran3(w0, w1, w3, 1)];                                            \
-      ++acc_[tran3(w0, w2, w3, 2)];                                            \
-      ++acc_[tran3(w0, w1, w4, 3)];                                            \
-      ++acc_[tran3(w0, w2, w4, 4)];                                            \
-      ++acc_[tran3(w0, w3, w4, 5)];                                            \
-      ++acc_[tran3(w4, w1, w0, 6)];                                            \
-      ++acc_[tran3(w4, w3, w0, 7)];                                            \
-                                                                               \
-      w4 = w3;                                                                 \
-      w3 = w2;                                                                 \
-      w2 = w1;                                                                 \
-      w1 = w0;                                                                 \
-    }                                                                          \
-                                                                               \
-    w_[0] = w1;                                                                \
-    w_[1] = w2;                                                                \
-    w_[2] = w3;                                                                \
-    w_[3] = w4;                                                                \
-                                                                               \
-    size_ += size;                                                             \
-  }                                                                            \
-  static_assert(true, "")
-
 #ifdef DWARFS_MULTIVERSIONING
-  __attribute__((target("avx"))) DWARFS_NILSIMSA_UPDATE_FAST_IMPL;
-  __attribute__((target("default")))
+  // __attribute__((target_clones("arch=tigerlake", "default")))
 #endif
-  DWARFS_NILSIMSA_UPDATE_FAST_IMPL;
+  void update_fast(uint8_t const* data, size_t size) {
+    uint8_t w1 = w_[0];
+    uint8_t w2 = w_[1];
+    uint8_t w3 = w_[2];
+    uint8_t w4 = w_[3];
 
-  std::array<size_t, 256> acc_;
-  std::array<uint_fast8_t, 4> w_;
+    for (size_t i = 0; i < size; ++i) {
+      uint8_t w0 = data[i];
+
+      ++acc_[tran3(w0, w1, w2, 0)];
+      ++acc_[tran3(w0, w1, w3, 1)];
+      ++acc_[tran3(w0, w1, w4, 3)];
+      ++acc_[tran3(w0, w2, w3, 2)];
+      ++acc_[tran3(w0, w2, w4, 4)];
+      ++acc_[tran3(w0, w3, w4, 5)];
+      ++acc_[tran3(w4, w1, w0, 6)];
+      ++acc_[tran3(w4, w3, w0, 7)];
+
+      w4 = w3;
+      w3 = w2;
+      w2 = w1;
+      w1 = w0;
+    }
+
+    w_[0] = w1;
+    w_[1] = w2;
+    w_[2] = w3;
+    w_[3] = w4;
+
+    size_ += size;
+  }
+
+  std::array<size_t, 256> acc_{};
+  std::array<uint8_t, 4> w_{};
   size_t size_{0};
 };
 
@@ -191,20 +186,5 @@ void nilsimsa::update(uint8_t const* data, size_t size) {
 }
 
 void nilsimsa::finalize(hash_type& hash) const { impl_->finalize(hash); }
-
-#ifdef DWARFS_MULTIVERSIONING
-__attribute__((target("popcnt"))) int
-nilsimsa::similarity(uint64_t const* a, uint64_t const* b) {
-  DWARFS_NILSIMSA_SIMILARITY(return, a, b);
-}
-
-__attribute__((target("default")))
-#endif
-int nilsimsa::similarity(uint64_t const* a, uint64_t const* b) {
-  DWARFS_NILSIMSA_SIMILARITY(return, a, b);
-}
-
-static_assert(std::is_same_v<unsigned long, uint64_t> ||
-              std::is_same_v<unsigned long long, uint64_t>);
 
 } // namespace dwarfs

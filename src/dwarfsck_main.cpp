@@ -19,7 +19,6 @@
  * along with dwarfs.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <string_view>
@@ -27,34 +26,39 @@
 
 #include <boost/program_options.hpp>
 
-#include <folly/File.h>
-#include <folly/FileUtil.h>
 #include <folly/String.h>
 #include <folly/json.h>
 #include <folly/portability/Unistd.h>
 #include <folly/system/HardwareConcurrency.h>
 
 #include "dwarfs/error.h"
+#include "dwarfs/file_access.h"
 #include "dwarfs/filesystem_v2.h"
+#include "dwarfs/iolayer.h"
 #include "dwarfs/logger.h"
 #include "dwarfs/mmap.h"
 #include "dwarfs/options.h"
+#include "dwarfs/os_access.h"
 #include "dwarfs/tool.h"
+#include "dwarfs/util.h"
 #include "dwarfs_tool_main.h"
 
 namespace dwarfs {
 
 namespace po = boost::program_options;
 
-int dwarfsck_main(int argc, sys_char** argv) {
+int dwarfsck_main(int argc, sys_char** argv, iolayer const& iol) {
   const size_t num_cpu = std::max(folly::hardware_concurrency(), 1u);
 
-  std::string log_level, input, export_metadata, image_offset;
+  std::string input, export_metadata, image_offset;
+  logger_options logopts;
   size_t num_workers;
   int detail;
-  bool json = false;
-  bool check_integrity = false;
-  bool print_header = false;
+  bool quiet{false};
+  bool output_json{false};
+  bool check_integrity{false};
+  bool no_check{false};
+  bool print_header{false};
 
   // clang-format off
   po::options_description opts("Command line options");
@@ -65,6 +69,9 @@ int dwarfsck_main(int argc, sys_char** argv) {
     ("detail,d",
         po::value<int>(&detail)->default_value(2),
         "detail level")
+    ("quiet,q",
+        po::value<bool>(&quiet)->zero_tokens(),
+        "don't print anything unless an error occurs")
     ("image-offset,O",
         po::value<std::string>(&image_offset)->default_value("auto"),
         "filesystem image offset in bytes")
@@ -77,18 +84,19 @@ int dwarfsck_main(int argc, sys_char** argv) {
     ("check-integrity",
         po::value<bool>(&check_integrity)->zero_tokens(),
         "check integrity of each block")
-    ("json",
-        po::value<bool>(&json)->zero_tokens(),
-        "print metadata in JSON format")
+    ("no-check",
+        po::value<bool>(&no_check)->zero_tokens(),
+        "don't even verify block checksums")
+    ("json,j",
+        po::value<bool>(&output_json)->zero_tokens(),
+        "print information in JSON format")
     ("export-metadata",
         po::value<std::string>(&export_metadata),
         "export raw metadata as JSON to file")
-    ("log-level",
-        po::value<std::string>(&log_level)->default_value("info"),
-        "log level (error, warn, info, debug, trace)")
-    ("help,h",
-        "output help message and exit");
+    ;
   // clang-format on
+
+  add_common_options(opts, logopts);
 
   po::positional_options_description pos;
   pos.add("input", -1);
@@ -103,76 +111,117 @@ int dwarfsck_main(int argc, sys_char** argv) {
               vm);
     po::notify(vm);
   } catch (po::error const& e) {
-    std::cerr << "error: " << e.what() << "\n";
+    iol.err << "error: " << e.what() << "\n";
     return 1;
   }
 
+#ifdef DWARFS_BUILTIN_MANPAGE
+  if (vm.count("man")) {
+    show_manpage(manpage::get_dwarfsck_manpage(), iol);
+    return 0;
+  }
+#endif
+
+  auto constexpr usage = "Usage: dwarfsck [OPTIONS...]\n";
+
   if (vm.count("help") or !vm.count("input")) {
-    std::cout << tool_header("dwarfsck") << opts << "\n";
+    iol.out << tool_header("dwarfsck") << usage << "\n" << opts << "\n";
     return 0;
   }
 
   try {
-    auto level = logger::parse_level(log_level);
-    stream_logger lgr(std::cerr, level, level >= logger::DEBUG);
+    stream_logger lgr(iol.term, iol.err, logopts);
     LOG_PROXY(debug_logger_policy, lgr);
+
+    if (no_check && check_integrity) {
+      LOG_WARN << "--no-check and --check-integrity are mutually exclusive";
+      return 1;
+    }
+
+    if (print_header &&
+        (output_json || !export_metadata.empty() || check_integrity)) {
+      LOG_WARN << "--print-header is mutually exclusive with --json, "
+                  "--export-metadata and --check-integrity";
+      return 1;
+    }
 
     filesystem_options fsopts;
 
-    fsopts.metadata.check_consistency = true;
+    fsopts.metadata.enable_nlink = true;
+    fsopts.metadata.check_consistency = check_integrity;
+    fsopts.image_offset = parse_image_offset(image_offset);
 
-    try {
-      fsopts.image_offset = image_offset == "auto"
-                                ? filesystem_options::IMAGE_OFFSET_AUTO
-                                : folly::to<file_off_t>(image_offset);
-    } catch (...) {
-      DWARFS_THROW(runtime_error, "failed to parse offset: " + image_offset);
-    }
+    std::shared_ptr<mmif> mm = iol.os->map_file(input);
 
-    auto mm = std::make_shared<mmap>(input);
-
-    if (!export_metadata.empty()) {
-      auto of = folly::File(export_metadata, O_RDWR | O_CREAT | O_TRUNC);
-      filesystem_v2 fs(lgr, mm, fsopts);
-      auto json = fs.serialize_metadata_as_json(false);
-      if (folly::writeFull(of.fd(), json.data(), json.size()) < 0) {
-        LOG_ERROR << "failed to export metadata";
-      }
-      of.close();
-    } else if (json) {
-      filesystem_v2 fs(lgr, mm, fsopts);
-      std::cout << folly::toPrettyJson(fs.metadata_as_dynamic()) << "\n";
-    } else if (print_header) {
+    if (print_header) {
       if (auto hdr = filesystem_v2::header(mm, fsopts.image_offset)) {
 #ifdef _WIN32
-        ::_setmode(STDOUT_FILENO, _O_BINARY);
+        if (&iol.out == &std::cout) {
+          ::_setmode(::_fileno(stdout), _O_BINARY);
+        }
 #endif
-        if (::write(STDOUT_FILENO, hdr->data(), hdr->size()) < 0) {
-          LOG_ERROR << "error writing header: " << ::strerror(errno);
+        iol.out.write(reinterpret_cast<char const*>(hdr->data()), hdr->size());
+        if (iol.out.bad() || iol.out.fail()) {
+          LOG_ERROR << "error writing header";
           return 1;
         }
       } else {
-        LOG_ERROR << "filesystem does not contain a header";
-        return 1;
+        LOG_WARN << "filesystem does not contain a header";
+        return 2;
       }
     } else {
-      if (filesystem_v2::identify(lgr, mm, std::cout, detail, num_workers,
-                                  check_integrity, fsopts.image_offset) != 0) {
-        return 1;
+      filesystem_v2 fs(lgr, *iol.os, mm, fsopts);
+
+      if (!export_metadata.empty()) {
+        std::error_code ec;
+        auto of = iol.file->open_output(export_metadata, ec);
+        if (ec) {
+          LOG_ERROR << "failed to open metadata output file: " << ec.message();
+          return 1;
+        }
+        auto json = fs.serialize_metadata_as_json(false);
+        of->os().write(json.data(), json.size());
+        of->close(ec);
+        if (ec) {
+          LOG_ERROR << "failed to close metadata output file: " << ec.message();
+          return 1;
+        }
+      } else {
+        auto level = check_integrity ? filesystem_check_level::FULL
+                                     : filesystem_check_level::CHECKSUM;
+        auto errors = no_check ? 0 : fs.check(level, num_workers);
+
+        if (!quiet) {
+          if (output_json) {
+            iol.out << folly::toPrettyJson(fs.info_as_dynamic(detail)) << "\n";
+          } else {
+            fs.dump(iol.out, detail);
+          }
+        }
+
+        if (errors > 0) {
+          return 1;
+        }
       }
     }
-  } catch (system_error const& e) {
-    std::cerr << folly::exceptionStr(e) << "\n";
-    return 1;
-  } catch (runtime_error const& e) {
-    std::cerr << folly::exceptionStr(e) << "\n";
-    return 1;
-  } catch (std::system_error const& e) {
-    std::cerr << folly::exceptionStr(e) << "\n";
+  } catch (std::exception const& e) {
+    iol.err << folly::exceptionStr(e) << "\n";
     return 1;
   }
 
   return 0;
+}
+
+int dwarfsck_main(int argc, sys_char** argv) {
+  return dwarfsck_main(argc, argv, iolayer::system_default());
+}
+
+int dwarfsck_main(std::span<std::string> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, dwarfsck_main);
+}
+
+int dwarfsck_main(std::span<std::string_view> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, dwarfsck_main);
 }
 
 } // namespace dwarfs

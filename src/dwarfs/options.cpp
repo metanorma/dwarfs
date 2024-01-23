@@ -39,8 +39,8 @@ std::ostream& operator<<(std::ostream& os, file_order_mode mode) {
   case file_order_mode::PATH:
     modestr = "path";
     break;
-  case file_order_mode::SCRIPT:
-    modestr = "script";
+  case file_order_mode::REVPATH:
+    modestr = "revpath";
     break;
   case file_order_mode::SIMILARITY:
     modestr = "similarity";
@@ -48,11 +48,18 @@ std::ostream& operator<<(std::ostream& os, file_order_mode mode) {
   case file_order_mode::NILSIMSA:
     modestr = "nilsimsa";
     break;
-  default:
-    break;
   }
 
   return os << modestr;
+}
+
+std::ostream& operator<<(std::ostream& os, block_cache_options const& opts) {
+  os << fmt::format(
+      "max_bytes={}, num_workers={}, decompress_ratio={}, mm_release={}, "
+      "init_workers={}, disable_block_integrity_check={}",
+      opts.max_bytes, opts.num_workers, opts.decompress_ratio, opts.mm_release,
+      opts.init_workers, opts.disable_block_integrity_check);
+  return os;
 }
 
 mlock_mode parse_mlock_mode(std::string_view mode) {

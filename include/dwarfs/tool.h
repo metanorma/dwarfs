@@ -24,9 +24,25 @@
 #include <string>
 #include <string_view>
 
+#include <boost/program_options.hpp>
+
+#ifdef DWARFS_BUILTIN_MANPAGE
+#include "dwarfs/manpage.h"
+#endif
+
 namespace dwarfs {
+
+struct logger_options;
+struct iolayer;
 
 std::string
 tool_header(std::string_view tool_name, std::string_view extra_info = "");
+
+void add_common_options(boost::program_options::options_description& opts,
+                        logger_options& logopts);
+
+#ifdef DWARFS_BUILTIN_MANPAGE
+void show_manpage(manpage::document doc, iolayer const& iol);
+#endif
 
 } // namespace dwarfs

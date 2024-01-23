@@ -35,15 +35,19 @@
 #include <thrift/lib/cpp2/protocol/DebugProtocol.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 
+#include <folly/container/Enumerate.h>
 #include <folly/container/F14Set.h>
 #include <folly/portability/Stdlib.h>
 #include <folly/portability/Unistd.h>
+#include <folly/stats/Histogram.h>
 
 #include <fsst.h>
 
 #include "dwarfs/error.h"
+#include "dwarfs/features.h"
 #include "dwarfs/file_stat.h"
 #include "dwarfs/fstypes.h"
 #include "dwarfs/logger.h"
@@ -136,12 +140,34 @@ map_frozen(std::span<uint8_t const> schema, std::span<uint8_t const> data) {
   return ret;
 }
 
+MappedFrozen<thrift::metadata::metadata>
+check_frozen(MappedFrozen<thrift::metadata::metadata> meta) {
+  if (meta.features()) {
+    auto unsupported = feature_set::get_unsupported(meta.features()->thaw());
+    if (!unsupported.empty()) {
+      DWARFS_THROW(runtime_error,
+                   fmt::format("file system uses the following features "
+                               "unsupported by this build: {}",
+                               boost::join(unsupported, ", ")));
+    }
+  }
+  return meta;
+}
+
+global_metadata::Meta const&
+check_metadata_consistency(logger& lgr, global_metadata::Meta const& meta,
+                           bool force_consistency_check) {
+  if (force_consistency_check) {
+    global_metadata::check_consistency(lgr, meta);
+  }
+  return meta;
+}
+
 void analyze_frozen(std::ostream& os,
                     MappedFrozen<thrift::metadata::metadata> const& meta,
                     size_t total_size, int detail) {
   using namespace ::apache::thrift::frozen;
-  std::ostringstream oss;
-  stream_logger lgr(oss);
+  null_logger lgr;
 
   auto layout = meta.findFirstOfType<
       std::unique_ptr<Layout<thrift::metadata::metadata>>>();
@@ -237,6 +263,15 @@ void analyze_frozen(std::ostream& os,
     }                                                                          \
   } while (0)
 
+#define META_OPT_STRING_LIST_SIZE(x)                                           \
+  do {                                                                         \
+    if (auto list = meta.x()) {                                                \
+      add_string_list_size(#x, *list, l->x##Field.layout.valueField);          \
+    }                                                                          \
+  } while (0)
+
+#define META_OPT_STRING_SET_SIZE(x) META_OPT_STRING_LIST_SIZE(x)
+
 #define META_OPT_STRING_TABLE_SIZE(x)                                          \
   do {                                                                         \
     if (auto table = meta.x()) {                                               \
@@ -248,6 +283,10 @@ void analyze_frozen(std::ostream& os,
   META_LIST_SIZE(directories);
   META_LIST_SIZE(inodes);
   META_LIST_SIZE(chunk_table);
+  if (!meta.entry_table_v2_2().empty()) {
+    // deprecated, so only list if non-empty
+    META_LIST_SIZE(entry_table_v2_2);
+  }
   META_LIST_SIZE(symlink_table);
   META_LIST_SIZE(uids);
   META_LIST_SIZE(gids);
@@ -263,7 +302,14 @@ void analyze_frozen(std::ostream& os,
   META_STRING_LIST_SIZE(names);
   META_STRING_LIST_SIZE(symlinks);
 
+  META_OPT_STRING_SET_SIZE(features);
+
+  META_OPT_STRING_LIST_SIZE(category_names);
+  META_OPT_LIST_SIZE(block_categories);
+
 #undef META_LIST_SIZE
+#undef META_OPT_STRING_SET_SIZE
+#undef META_OPT_STRING_LIST_SIZE
 #undef META_STRING_LIST_SIZE
 #undef META_OPT_LIST_SIZE
 #undef META_OPT_STRING_TABLE_SIZE
@@ -290,6 +336,53 @@ void analyze_frozen(std::ostream& os,
   }
 }
 
+template <typename Function>
+void parse_metadata_options(
+    MappedFrozen<thrift::metadata::metadata> const& meta, Function&& func) {
+  if (auto opt = meta.options()) {
+    func("mtime_only", opt->mtime_only());
+    func("packed_chunk_table", opt->packed_chunk_table());
+    func("packed_directories", opt->packed_directories());
+    func("packed_shared_files_table", opt->packed_shared_files_table());
+  }
+  if (auto names = meta.compact_names()) {
+    func("packed_names", static_cast<bool>(names->symtab()));
+    func("packed_names_index", names->packed_index());
+  }
+  if (auto symlinks = meta.compact_symlinks()) {
+    func("packed_symlinks", static_cast<bool>(symlinks->symtab()));
+    func("packed_symlinks_index", symlinks->packed_index());
+  }
+}
+
+struct category_info {
+  size_t count{0};
+  size_t compressed_size{0};
+  size_t uncompressed_size{0};
+  bool uncompressed_size_is_estimate{false};
+};
+
+std::map<size_t, category_info>
+get_category_info(MappedFrozen<thrift::metadata::metadata> const& meta,
+                  filesystem_info const& fsinfo) {
+  std::map<size_t, category_info> catinfo;
+
+  if (auto blockcat = meta.block_categories()) {
+    for (auto [block, category] : folly::enumerate(blockcat.value())) {
+      auto& ci = catinfo[category];
+      ++ci.count;
+      ci.compressed_size += fsinfo.compressed_block_sizes.at(block);
+      if (auto size = fsinfo.uncompressed_block_sizes.at(block)) {
+        ci.uncompressed_size += *size;
+      } else {
+        ci.uncompressed_size_is_estimate = true;
+      }
+    }
+  }
+
+  return catinfo;
+}
+
 const uint16_t READ_ONLY_MASK = ~uint16_t(
     fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write);
 
@@ -302,10 +395,12 @@ class metadata_ final : public metadata_v2::impl {
             std::span<uint8_t const> data, metadata_options const& options,
             int inode_offset, bool force_consistency_check)
       : data_(data)
-      , meta_(map_frozen<thrift::metadata::metadata>(schema, data_))
-      , global_(lgr, &meta_,
-                options.check_consistency || force_consistency_check)
-      , root_(dir_entry_view::from_dir_entry_index(0, &global_))
+      , meta_(
+            check_frozen(map_frozen<thrift::metadata::metadata>(schema, data_)))
+      , global_(lgr, check_metadata_consistency(lgr, meta_,
+                                                options.check_consistency ||
+                                                    force_consistency_check))
+      , root_(dir_entry_view::from_dir_entry_index(0, global_))
       , LOG_PROXY_INIT(lgr)
       , inode_offset_(inode_offset)
       , symlink_inode_offset_(find_inode_offset(inode_rank::INO_LNK))
@@ -375,16 +470,19 @@ class metadata_ final : public metadata_v2::impl {
     }
   }
 
+  void check_consistency() const override;
+
   void dump(std::ostream& os, int detail_level, filesystem_info const& fsinfo,
             std::function<void(const std::string&, uint32_t)> const& icb)
       const override;
+
+  folly::dynamic info_as_dynamic(int detail_level,
+                                 filesystem_info const& fsinfo) const override;
 
   folly::dynamic as_dynamic() const override;
   std::string serialize_as_json(bool simple) const override;
 
   size_t size() const override { return data_.size(); }
-
-  bool empty() const override { return data_.empty(); }
 
   void walk(std::function<void(dir_entry_view)> const& func) const override {
     walk_tree([&](uint32_t self_index, uint32_t parent_index) {
@@ -430,6 +528,13 @@ class metadata_ final : public metadata_v2::impl {
 
   bool has_symlinks() const override { return !meta_.symlink_table().empty(); }
 
+  folly::dynamic get_inode_info(inode_view iv) const override;
+
+  std::optional<std::string>
+  get_block_category(size_t block_number) const override;
+
+  std::vector<std::string> get_all_block_categories() const override;
+
  private:
   template <typename K>
   using set_type = folly::F14ValueSet<K>;
@@ -440,13 +545,13 @@ class metadata_ final : public metadata_v2::impl {
     // TODO: move compatibility details to metadata_types
     uint32_t index =
         meta_.dir_entries() ? inode : meta_.entry_table_v2_2()[inode];
-    return inode_view(meta_.inodes()[index], inode, &meta_);
+    return inode_view(meta_.inodes()[index], inode, meta_);
   }
 
   dir_entry_view
   make_dir_entry_view(uint32_t self_index, uint32_t parent_index) const {
     return dir_entry_view::from_dir_entry_index(self_index, parent_index,
-                                                &global_);
+                                                global_);
   }
 
   // This represents the order in which inodes are stored in inodes
@@ -480,28 +585,6 @@ class metadata_ final : public metadata_v2::impl {
     }
   }
 
-  static char get_filetype_label(uint16_t mode) {
-    switch (posix_file_type::from_mode(mode)) {
-    case posix_file_type::regular:
-      return '-';
-    case posix_file_type::directory:
-      return 'd';
-    case posix_file_type::symlink:
-      return 'l';
-    case posix_file_type::block:
-      return 'b';
-    case posix_file_type::character:
-      return 'c';
-    case posix_file_type::fifo:
-      return 'p';
-    case posix_file_type::socket:
-      return 's';
-    default:
-      DWARFS_THROW(runtime_error,
-                   fmt::format("unknown file type: {:#06x}", mode));
-    }
-  }
-
   size_t find_inode_offset(inode_rank rank) const {
     if (meta_.dir_entries()) {
       auto range = boost::irange(size_t(0), meta_.inodes().size());
@@ -528,8 +611,11 @@ class metadata_ final : public metadata_v2::impl {
 
   directory_view make_directory_view(inode_view iv) const {
     // TODO: revisit: is this the way to do it?
-    return directory_view(iv.inode_num(), &global_);
+    DWARFS_CHECK(iv.is_directory(), "not a directory");
+    return directory_view(iv.inode_num(), global_);
   }
+
+  void analyze_chunks(std::ostream& os) const;
 
   // TODO: see if we really need to pass the extra dir_entry_view in
   //       addition to directory_view
@@ -545,8 +631,6 @@ class metadata_ final : public metadata_v2::impl {
 
   std::optional<inode_view>
   find(directory_view dir, std::string_view name) const;
-
-  std::string modestring(uint16_t mode) const;
 
   uint32_t chunk_table_lookup(uint32_t ino) const {
     return chunk_table_.empty() ? meta_.chunk_table()[ino] : chunk_table_[ino];
@@ -581,7 +665,7 @@ class metadata_ final : public metadata_v2::impl {
         inode < (static_cast<int>(meta_.chunk_table().size()) - 1)) {
       uint32_t begin = chunk_table_lookup(inode);
       uint32_t end = chunk_table_lookup(inode + 1);
-      rv = chunk_range(&meta_, begin, end);
+      rv = chunk_range(meta_, begin, end);
     }
 
     return rv;
@@ -763,6 +847,70 @@ class metadata_ final : public metadata_v2::impl {
 };
 
 template <typename LoggerPolicy>
+void metadata_<LoggerPolicy>::analyze_chunks(std::ostream& os) const {
+  folly::Histogram<size_t> block_refs{1, 0, 1024};
+  folly::Histogram<size_t> chunk_count{1, 0, 65536};
+  size_t mergeable_chunks{0};
+
+  for (size_t i = 1; i < meta_.chunk_table().size(); ++i) {
+    uint32_t beg = chunk_table_lookup(i - 1);
+    uint32_t end = chunk_table_lookup(i);
+    uint32_t num = end - beg;
+
+    assert(beg <= end);
+
+    if (num > 1) {
+      std::unordered_set<size_t> blocks;
+
+      for (uint32_t k = beg; k < end; ++k) {
+        auto chk = meta_.chunks()[k];
+        blocks.emplace(chk.block());
+
+        if (k > beg) {
+          auto prev = meta_.chunks()[k - 1];
+          if (prev.block() == chk.block()) {
+            if (prev.offset() + prev.size() == chk.offset()) {
+              ++mergeable_chunks;
+            }
+          }
+        }
+      }
+
+      block_refs.addValue(blocks.size());
+    } else {
+      block_refs.addValue(num);
+    }
+
+    chunk_count.addValue(num);
+  }
+
+  {
+    auto pct = [&](double p) { return block_refs.getPercentileEstimate(p); };
+
+    os << "single file block refs p50: " << pct(0.5) << ", p75: " << pct(0.75)
+       << ", p90: " << pct(0.9) << ", p95: " << pct(0.95)
+       << ", p99: " << pct(0.99) << ", p99.9: " << pct(0.999) << "\n";
+  }
+
+  {
+    auto pct = [&](double p) { return chunk_count.getPercentileEstimate(p); };
+
+    os << "single file chunk count p50: " << pct(0.5) << ", p75: " << pct(0.75)
+       << ", p90: " << pct(0.9) << ", p95: " << pct(0.95)
+       << ", p99: " << pct(0.99) << ", p99.9: " << pct(0.999) << "\n";
+  }
+
+  // TODO: we can remove this once we have no more mergeable chunks :-)
+  os << "mergeable chunks: " << mergeable_chunks << "/" << meta_.chunks().size()
+     << "\n";
+}
+
+template <typename LoggerPolicy>
+void metadata_<LoggerPolicy>::check_consistency() const {
+  global_.check_consistency(LOG_GET_LOGGER);
+}
+
+template <typename LoggerPolicy>
 void metadata_<LoggerPolicy>::dump(
     std::ostream& os, const std::string& indent, dir_entry_view entry,
     int detail_level,
@@ -771,7 +919,7 @@ void metadata_<LoggerPolicy>::dump(
   auto mode = iv.mode();
   auto inode = iv.inode_num();
 
-  os << indent << "<inode:" << inode << "> " << modestring(mode);
+  os << indent << "<inode:" << inode << "> " << file_stat::mode_string(mode);
 
   if (inode > 0) {
     os << " " << entry.name();
@@ -813,6 +961,114 @@ void metadata_<LoggerPolicy>::dump(
     os << " (socket)\n";
     break;
   }
+}
+
+template <typename LoggerPolicy>
+folly::dynamic
+metadata_<LoggerPolicy>::info_as_dynamic(int detail_level,
+                                         filesystem_info const& fsinfo) const {
+  folly::dynamic info = folly::dynamic::object;
+  vfs_stat stbuf;
+  statvfs(&stbuf);
+
+  if (auto version = meta_.dwarfs_version()) {
+    info["created_by"] = version.value();
+  }
+
+  if (auto ts = meta_.create_timestamp()) {
+    info["created_on"] =
+        fmt::format("{:%Y-%m-%dT%H:%M:%S}", fmt::localtime(ts.value()));
+  }
+
+  if (detail_level > 0) {
+    info["block_size"] = stbuf.bsize;
+    info["block_count"] = fsinfo.block_count;
+    info["inode_count"] = stbuf.files;
+    if (auto ps = meta_.preferred_path_separator()) {
+      info["preferred_path_separator"] = std::string(1, static_cast<char>(*ps));
+    }
+    info["original_filesystem_size"] = stbuf.blocks;
+    info["compressed_block_size"] = fsinfo.compressed_block_size;
+    if (!fsinfo.uncompressed_block_size_is_estimate) {
+      info["uncompressed_block_size"] = fsinfo.uncompressed_block_size;
+    }
+    info["compressed_metadata_size"] = fsinfo.compressed_metadata_size;
+    if (!fsinfo.uncompressed_metadata_size_is_estimate) {
+      info["uncompressed_metadata_size"] = fsinfo.uncompressed_metadata_size;
+    }
+
+    if (auto opt = meta_.options()) {
+      folly::dynamic options = folly::dynamic::array;
+      parse_metadata_options(meta_, [&](auto const& name, bool value) {
+        if (value) {
+          options.push_back(name);
+        }
+      });
+      info["options"] = std::move(options);
+      if (auto res = opt->time_resolution_sec()) {
+        info["time_resolution"] = *res;
+      }
+    }
+
+    if (meta_.block_categories()) {
+      auto catnames = *meta_.category_names();
+      auto catinfo = get_category_info(meta_, fsinfo);
+      folly::dynamic categories = folly::dynamic::object;
+      for (auto const& [category, ci] : catinfo) {
+        categories[catnames[category]] = folly::dynamic::object(
+            "block_count", ci.count)("compressed_size", ci.compressed_size);
+        if (!ci.uncompressed_size_is_estimate) {
+          categories[catnames[category]]["uncompressed_size"] =
+              ci.uncompressed_size;
+        }
+      }
+      info["categories"] = std::move(categories);
+    }
+  }
+
+  if (detail_level > 2) {
+    folly::dynamic meta = folly::dynamic::object;
+    meta["symlink_inode_offset"] = symlink_inode_offset_;
+    meta["file_inode_offset"] = file_inode_offset_;
+    meta["dev_inode_offset"] = dev_inode_offset_;
+    meta["chunks"] = meta_.chunks().size();
+    meta["directories"] = meta_.directories().size();
+    meta["inodes"] = meta_.inodes().size();
+    meta["chunk_table"] = meta_.chunk_table().size();
+    meta["entry_table_v2_2"] = meta_.entry_table_v2_2().size();
+    meta["symlink_table"] = meta_.symlink_table().size();
+    meta["uids"] = meta_.uids().size();
+    meta["gids"] = meta_.gids().size();
+    meta["modes"] = meta_.modes().size();
+    meta["names"] = meta_.names().size();
+    meta["symlinks"] = meta_.symlinks().size();
+
+    if (auto dev = meta_.devices()) {
+      meta["devices"] = dev->size();
+    }
+
+    if (auto de = meta_.dir_entries()) {
+      meta["dir_entries"] = de->size();
+    }
+
+    if (auto sfp = meta_.shared_files_table()) {
+      if (meta_.options()->packed_shared_files_table()) {
+        meta["packed_shared_files_table"] = sfp->size();
+        meta["unpacked_shared_files_table"] = shared_files_.size();
+      } else {
+        meta["shared_files_table"] = sfp->size();
+      }
+      meta["unique_files"] = unique_files_;
+    }
+
+    info["meta"] = std::move(meta);
+  }
+
+  if (detail_level > 3) {
+    info["root"] = as_dynamic(root_);
+  }
+
+  return info;
 }
 
 // TODO: can we move this to dir_entry_view?
@@ -860,41 +1116,61 @@ void metadata_<LoggerPolicy>::dump(
     }
     os << "original filesystem size: " << size_with_unit(stbuf.blocks) << "\n";
     os << "compressed block size: "
-       << size_with_unit(fsinfo.compressed_block_size)
-       << fmt::format(" ({0:.2f}%)", (100.0 * fsinfo.compressed_block_size) /
-                                         fsinfo.uncompressed_block_size)
-       << "\n";
-    os << "uncompressed block size: "
-       << size_with_unit(fsinfo.uncompressed_block_size) << "\n";
+       << size_with_unit(fsinfo.compressed_block_size);
+    if (!fsinfo.uncompressed_block_size_is_estimate) {
+      os << fmt::format(" ({0:.2f}%)", (100.0 * fsinfo.compressed_block_size) /
+                                           fsinfo.uncompressed_block_size);
+    }
+    os << "\n";
+    os << "uncompressed block size: ";
+    if (fsinfo.uncompressed_block_size_is_estimate) {
+      os << "(at least) ";
+    }
+    os << size_with_unit(fsinfo.uncompressed_block_size) << "\n";
     os << "compressed metadata size: "
-       << size_with_unit(fsinfo.compressed_metadata_size)
-       << fmt::format(" ({0:.2f}%)", (100.0 * fsinfo.compressed_metadata_size) /
-                                         fsinfo.uncompressed_metadata_size)
-       << "\n";
-    os << "uncompressed metadata size: "
-       << size_with_unit(fsinfo.uncompressed_metadata_size) << "\n";
+       << size_with_unit(fsinfo.compressed_metadata_size);
+    if (!fsinfo.uncompressed_metadata_size_is_estimate) {
+      os << fmt::format(" ({0:.2f}%)",
+                        (100.0 * fsinfo.compressed_metadata_size) /
+                            fsinfo.uncompressed_metadata_size);
+    }
+    os << "\n";
+    os << "uncompressed metadata size: ";
+    if (fsinfo.uncompressed_metadata_size_is_estimate) {
+      os << "(at least) ";
+    }
+    os << size_with_unit(fsinfo.uncompressed_metadata_size) << "\n";
     if (auto opt = meta_.options()) {
       std::vector<std::string> options;
-      auto boolopt = [&](auto const& name, bool value) {
+      parse_metadata_options(meta_, [&](auto const& name, bool value) {
         if (value) {
           options.push_back(name);
         }
-      };
-      boolopt("mtime_only", opt->mtime_only());
-      boolopt("packed_chunk_table", opt->packed_chunk_table());
-      boolopt("packed_directories", opt->packed_directories());
-      boolopt("packed_shared_files_table", opt->packed_shared_files_table());
-      if (auto names = meta_.compact_names()) {
-        boolopt("packed_names", static_cast<bool>(names->symtab()));
-        boolopt("packed_names_index", names->packed_index());
-      }
-      if (auto symlinks = meta_.compact_symlinks()) {
-        boolopt("packed_symlinks", static_cast<bool>(symlinks->symtab()));
-        boolopt("packed_symlinks_index", symlinks->packed_index());
-      }
+      });
       os << "options: " << boost::join(options, "\n         ") << "\n";
       if (auto res = opt->time_resolution_sec()) {
         os << "time resolution: " << *res << " seconds\n";
+      }
+    }
+
+    if (meta_.block_categories()) {
+      auto catnames = *meta_.category_names();
+      auto catinfo = get_category_info(meta_, fsinfo);
+      os << "categories:\n";
+      for (auto const& [category, ci] : catinfo) {
+        os << "  " << catnames[category] << ": " << ci.count << " blocks";
+        if (ci.uncompressed_size_is_estimate ||
+            ci.uncompressed_size != ci.compressed_size) {
+          os << ", " << size_with_unit(ci.compressed_size) << " compressed";
+        }
+        if (!ci.uncompressed_size_is_estimate) {
+          os << ", " << size_with_unit(ci.uncompressed_size) << " uncompressed";
+          if (ci.uncompressed_size != ci.compressed_size) {
+            os << fmt::format(" ({0:.2f}%)", (100.0 * ci.compressed_size) /
+                                                 ci.uncompressed_size);
+          }
+        }
+        os << "\n";
       }
     }
   }
@@ -933,6 +1209,7 @@ void metadata_<LoggerPolicy>::dump(
       }
       os << "unique files: " << unique_files_ << "\n";
     }
+    analyze_chunks(os);
   }
 
   if (detail_level > 5) {
@@ -969,7 +1246,7 @@ folly::dynamic metadata_<LoggerPolicy>::as_dynamic(dir_entry_view entry) const {
   auto inode = iv.inode_num();
 
   obj["mode"] = mode;
-  obj["modestring"] = modestring(mode);
+  obj["modestring"] = file_stat::mode_string(mode);
   obj["inode"] = inode;
 
   if (inode > 0) {
@@ -1070,27 +1347,6 @@ std::string metadata_<LoggerPolicy>::serialize_as_json(bool simple) const {
     serializer.serialize(unpack_metadata(), &json);
   }
   return json;
-}
-
-template <typename LoggerPolicy>
-std::string metadata_<LoggerPolicy>::modestring(uint16_t mode) const {
-  std::ostringstream oss;
-
-  oss << (mode & uint16_t(fs::perms::set_uid) ? 'U' : '-');
-  oss << (mode & uint16_t(fs::perms::set_gid) ? 'G' : '-');
-  oss << (mode & uint16_t(fs::perms::sticky_bit) ? 'S' : '-');
-  oss << get_filetype_label(mode);
-  oss << (mode & uint16_t(fs::perms::owner_read) ? 'r' : '-');
-  oss << (mode & uint16_t(fs::perms::owner_write) ? 'w' : '-');
-  oss << (mode & uint16_t(fs::perms::owner_exec) ? 'x' : '-');
-  oss << (mode & uint16_t(fs::perms::group_read) ? 'r' : '-');
-  oss << (mode & uint16_t(fs::perms::group_write) ? 'w' : '-');
-  oss << (mode & uint16_t(fs::perms::group_exec) ? 'x' : '-');
-  oss << (mode & uint16_t(fs::perms::others_read) ? 'r' : '-');
-  oss << (mode & uint16_t(fs::perms::others_write) ? 'w' : '-');
-  oss << (mode & uint16_t(fs::perms::others_exec) ? 'x' : '-');
-
-  return oss.str();
 }
 
 template <typename LoggerPolicy>
@@ -1206,14 +1462,14 @@ metadata_<LoggerPolicy>::find(directory_view dir, std::string_view name) const {
 
   auto it = std::lower_bound(range.begin(), range.end(), name,
                              [&](auto ix, std::string_view name) {
-                               return dir_entry_view::name(ix, &global_) < name;
+                               return dir_entry_view::name(ix, global_) < name;
                              });
 
   std::optional<inode_view> rv;
 
   if (it != range.end()) {
-    if (dir_entry_view::name(*it, &global_) == name) {
-      rv = dir_entry_view::inode(*it, &global_);
+    if (dir_entry_view::name(*it, global_) == name) {
+      rv = dir_entry_view::inode(*it, global_);
     }
   }
 
@@ -1232,6 +1488,10 @@ metadata_<LoggerPolicy>::find(const char* path) const {
   while (*path) {
     const char* next = ::strchr(path, '/');
     size_t clen = next ? next - path : ::strlen(path); // Flawfinder: ignore
+
+    if (!iv->is_directory()) {
+      return std::nullopt;
+    }
 
     iv = find(make_directory_view(*iv), std::string_view(path, clen));
 
@@ -1256,6 +1516,10 @@ metadata_<LoggerPolicy>::find(int inode, const char* name) const {
   auto iv = get_entry(inode);
 
   if (iv) {
+    if (!iv->is_directory()) {
+      return std::nullopt;
+    }
+
     iv = find(make_directory_view(*iv), std::string_view(name));
   }
 
@@ -1339,8 +1603,8 @@ metadata_<LoggerPolicy>::readdir(directory_view dir, size_t offset) const {
     }
 
     auto index = dir.first_entry() + offset;
-    auto inode = dir_entry_view::inode(index, &global_);
-    return std::pair(inode, dir_entry_view::name(index, &global_));
+    auto inode = dir_entry_view::inode(index, global_);
+    return std::pair(inode, dir_entry_view::name(index, global_));
   }
 
   return std::nullopt;
@@ -1356,25 +1620,34 @@ int metadata_<LoggerPolicy>::access(inode_view iv, int mode, uid_t uid,
 
   int access_mode = 0;
 
-  auto test = [e_mode = iv.mode(), &access_mode](fs::perms r_bit,
-                                                 fs::perms x_bit) {
+  auto test = [e_mode = iv.mode(), &access_mode, readonly = options_.readonly](
+                  fs::perms r_bit, fs::perms w_bit, fs::perms x_bit) {
     if (e_mode & uint16_t(r_bit)) {
       access_mode |= R_OK;
     }
+    if (e_mode & uint16_t(w_bit)) {
+      if (!readonly) {
+        access_mode |= W_OK;
+      }
+    }
     if (e_mode & uint16_t(x_bit)) {
+#ifdef _WIN32
+      access_mode |= 1; // Windows has no notion of X_OK
+#else
       access_mode |= X_OK;
+#endif
     }
   };
 
   // Let's build the inode's access mask
-  test(fs::perms::others_read, fs::perms::others_exec);
+  test(fs::perms::others_read, fs::perms::others_write, fs::perms::others_exec);
 
   if (iv.getgid() == gid) {
-    test(fs::perms::group_read, fs::perms::group_exec);
+    test(fs::perms::group_read, fs::perms::group_write, fs::perms::group_exec);
   }
 
   if (iv.getuid() == uid) {
-    test(fs::perms::owner_read, fs::perms::owner_exec);
+    test(fs::perms::owner_read, fs::perms::owner_write, fs::perms::owner_exec);
   }
 
   return (access_mode & mode) == mode ? 0 : EACCES;
@@ -1433,6 +1706,64 @@ template <typename LoggerPolicy>
 std::optional<chunk_range>
 metadata_<LoggerPolicy>::get_chunks(int inode) const {
   return get_chunk_range(inode - inode_offset_);
+}
+
+template <typename LoggerPolicy>
+folly::dynamic metadata_<LoggerPolicy>::get_inode_info(inode_view iv) const {
+  folly::dynamic obj = folly::dynamic::object;
+
+  auto chunk_range = get_chunk_range(iv.inode_num());
+
+  if (chunk_range) {
+    obj["chunks"] = folly::dynamic::array;
+
+    for (auto const& chunk : *chunk_range) {
+      folly::dynamic chk = folly::dynamic::object;
+
+      chk["block"] = chunk.block();
+      chk["offset"] = chunk.offset();
+      chk["size"] = chunk.size();
+
+      if (auto catname = get_block_category(chunk.block())) {
+        chk["category"] = catname.value();
+      }
+
+      obj["chunks"].push_back(chk);
+    }
+  }
+
+  obj["mode"] = iv.mode();
+  obj["modestring"] = file_stat::mode_string(iv.mode());
+  obj["uid"] = iv.getuid();
+  obj["gid"] = iv.getgid();
+
+  return obj;
+}
+
+template <typename LoggerPolicy>
+std::optional<std::string>
+metadata_<LoggerPolicy>::get_block_category(size_t block_number) const {
+  if (auto catnames = meta_.category_names()) {
+    if (auto categories = meta_.block_categories()) {
+      return std::string(catnames.value()[categories.value()[block_number]]);
+    }
+  }
+  return std::nullopt;
+}
+
+template <typename LoggerPolicy>
+std::vector<std::string>
+metadata_<LoggerPolicy>::get_all_block_categories() const {
+  std::vector<std::string> rv;
+
+  if (auto catnames = meta_.category_names()) {
+    rv.reserve(catnames.value().size());
+    for (auto const& name : catnames.value()) {
+      rv.emplace_back(name);
+    }
+  }
+
+  return rv;
 }
 
 std::pair<std::vector<uint8_t>, std::vector<uint8_t>>

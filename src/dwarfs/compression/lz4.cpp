@@ -38,6 +38,8 @@ struct lz4_compression_policy {
         reinterpret_cast<const char*>(src), reinterpret_cast<char*>(dest),
         folly::to<int>(size), folly::to<int>(destsize)));
   }
+
+  static std::string describe(int /*level*/) { return "lz4"; }
 };
 
 struct lz4hc_compression_policy {
@@ -46,6 +48,10 @@ struct lz4hc_compression_policy {
     return folly::to<size_t>(LZ4_compress_HC(
         reinterpret_cast<const char*>(src), reinterpret_cast<char*>(dest),
         folly::to<int>(size), folly::to<int>(destsize), level));
+  }
+
+  static std::string describe(int level) {
+    return fmt::format("lz4hc [level={}]", level);
   }
 };
 
@@ -61,7 +67,8 @@ class lz4_block_compressor final : public block_compressor::impl {
   }
 
   std::vector<uint8_t>
-  compress(const std::vector<uint8_t>& data) const override {
+  compress(const std::vector<uint8_t>& data,
+           std::string const* /*metadata*/) const override {
     std::vector<uint8_t> compressed(
         sizeof(uint32_t) + LZ4_compressBound(folly::to<int>(data.size())));
     *reinterpret_cast<uint32_t*>(&compressed[0]) = data.size();
@@ -78,11 +85,21 @@ class lz4_block_compressor final : public block_compressor::impl {
     return compressed;
   }
 
-  std::vector<uint8_t> compress(std::vector<uint8_t>&& data) const override {
-    return compress(data);
+  std::vector<uint8_t> compress(std::vector<uint8_t>&& data,
+                                std::string const* metadata) const override {
+    return compress(data, metadata);
   }
 
   compression_type type() const override { return compression_type::LZ4; }
+
+  std::string describe() const override { return Policy::describe(level_); }
+
+  std::string metadata_requirements() const override { return std::string(); }
+
+  compression_constraints
+  get_compression_constraints(std::string const&) const override {
+    return compression_constraints();
+  }
 
  private:
   const int level_;
@@ -107,6 +124,8 @@ class lz4_block_decompressor final : public block_decompressor::impl {
   }
 
   compression_type type() const override { return compression_type::LZ4; }
+
+  std::optional<std::string> metadata() const override { return std::nullopt; }
 
   bool decompress_frame(size_t) override {
     if (!error_.empty()) {
@@ -148,7 +167,11 @@ class lz4_compression_factory : public compression_factory {
  public:
   std::string_view name() const override { return "lz4"; }
 
-  std::string_view description() const override { return "LZ4 compression"; }
+  std::string_view description() const override {
+    static std::string const s_desc{
+        fmt::format("LZ4 compression (liblz4 {})", ::LZ4_versionString())};
+    return s_desc;
+  }
 
   std::vector<std::string> const& options() const override { return options_; }
 
@@ -175,7 +198,11 @@ class lz4hc_compression_factory : public compression_factory {
 
   std::string_view name() const override { return "lz4hc"; }
 
-  std::string_view description() const override { return "LZ4 HC compression"; }
+  std::string_view description() const override {
+    static std::string const s_desc{
+        fmt::format("LZ4 HC compression (liblz4 {})", ::LZ4_versionString())};
+    return s_desc;
+  }
 
   std::vector<std::string> const& options() const override { return options_; }
 

@@ -21,15 +21,20 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <limits>
 #include <memory>
 #include <utility>
 
+#include <folly/Expected.h>
 #include <folly/Function.h>
 
 namespace dwarfs {
+
+class logger;
+class os_access;
 
 /**
  * A group of worker threads
@@ -48,7 +53,8 @@ class worker_group {
    * \param num_workers     Number of worker threads.
    */
   explicit worker_group(
-      const char* group_name, size_t num_workers = 1,
+      logger& lgr, os_access const& os, const char* group_name,
+      size_t num_workers = 1,
       size_t max_queue_len = std::numeric_limits<size_t>::max(),
       int niceness = 0);
 
@@ -66,7 +72,13 @@ class worker_group {
   bool add_job(job_t&& job) { return impl_->add_job(std::move(job)); }
   size_t size() const { return impl_->size(); }
   size_t queue_size() const { return impl_->queue_size(); }
-  double get_cpu_time() const { return impl_->get_cpu_time(); }
+  folly::Expected<std::chrono::nanoseconds, std::error_code>
+  get_cpu_time() const {
+    return impl_->get_cpu_time();
+  }
+  bool set_affinity(std::vector<int> const& cpus) {
+    return impl_->set_affinity(cpus);
+  }
 
   template <typename T>
   bool add_job(std::packaged_task<T()>&& task) {
@@ -83,7 +95,9 @@ class worker_group {
     virtual bool add_job(job_t&& job) = 0;
     virtual size_t size() const = 0;
     virtual size_t queue_size() const = 0;
-    virtual double get_cpu_time() const = 0;
+    virtual folly::Expected<std::chrono::nanoseconds, std::error_code>
+    get_cpu_time() const = 0;
+    virtual bool set_affinity(std::vector<int> const& cpus) = 0;
   };
 
  private:

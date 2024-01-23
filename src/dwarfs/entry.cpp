@@ -36,11 +36,28 @@
 #include "dwarfs/options.h"
 #include "dwarfs/os_access.h"
 #include "dwarfs/progress.h"
+#include "dwarfs/scanner_progress.h"
 #include "dwarfs/util.h"
 
 #include "dwarfs/gen-cpp2/metadata_types.h"
 
 namespace dwarfs {
+
+namespace {
+
+constexpr std::string_view const kHashContext{"[hashing] "};
+constexpr char const kLocalPathSeparator{
+    static_cast<char>(std::filesystem::path::preferred_separator)};
+
+bool is_root_path(std::string_view path) {
+#if _WIN32
+  return path == "/" || path == "\\";
+#else
+  return path == "/";
+#endif
+}
+
+} // namespace
 
 entry::entry(std::filesystem::path const& path, std::shared_ptr<entry> parent,
              file_stat const& st)
@@ -84,8 +101,11 @@ std::string entry::path_as_string() const {
 
 std::string entry::dpath() const {
   auto p = path_as_string();
+  if (is_root_path(p)) {
+    return std::string(1, kLocalPathSeparator);
+  }
   if (type() == E_DIR) {
-    p += '/';
+    p += kLocalPathSeparator;
   }
   return p;
 }
@@ -93,7 +113,11 @@ std::string entry::dpath() const {
 std::string entry::unix_dpath() const {
   auto p = name_;
 
-  if (type() == E_DIR) {
+  if (is_root_path(p)) {
+    return "/";
+  }
+
+  if (type() == E_DIR && !p.empty()) {
     p += '/';
   }
 
@@ -121,30 +145,6 @@ bool entry::less_revpath(entry const& rhs) const {
   }
 
   return static_cast<bool>(rhs_p);
-}
-
-std::string entry::type_string() const {
-  switch (stat_.type()) {
-  case posix_file_type::regular:
-    return "file";
-  case posix_file_type::directory:
-    return "directory";
-  case posix_file_type::symlink:
-    return "link";
-  case posix_file_type::character:
-    return "chardev";
-  case posix_file_type::block:
-    return "blockdev";
-  case posix_file_type::fifo:
-    return "fifo";
-  case posix_file_type::socket:
-    return "socket";
-  default:
-    break;
-  }
-
-  DWARFS_THROW(runtime_error, fmt::format("unknown file type: {:#06x}",
-                                          fmt::underlying(stat_.type())));
 }
 
 bool entry::is_directory() const { return stat_.is_directory(); }
@@ -215,14 +215,8 @@ std::shared_ptr<inode> file::get_inode() const { return inode_; }
 
 void file::accept(entry_visitor& v, bool) { v.visit(this); }
 
-void file::scan(os_access& os, progress& prog) {
-  std::shared_ptr<mmif> mm;
-
-  if (size_t s = size(); s > 0) {
-    mm = os.map_file(fs_path(), s);
-  }
-
-  scan(mm.get(), prog, "xxh3-128");
+void file::scan(os_access const& /*os*/, progress& /*prog*/) {
+  DWARFS_THROW(runtime_error, "file::scan() without hash_alg is not used");
 }
 
 void file::scan(mmif* mm, progress& prog,
@@ -230,10 +224,18 @@ void file::scan(mmif* mm, progress& prog,
   size_t s = size();
 
   if (hash_alg) {
+    progress::scan_updater supd(prog.hash, s);
     checksum cs(*hash_alg);
 
     if (s > 0) {
-      constexpr size_t chunk_size = 32 << 20;
+      std::shared_ptr<scanner_progress> pctx;
+      auto const chunk_size = prog.hash.chunk_size.load();
+
+      if (s >= 4 * chunk_size) {
+        pctx = prog.create_context<scanner_progress>(
+            termcolor::MAGENTA, kHashContext, path_as_string(), s);
+      }
+
       size_t offset = 0;
 
       assert(mm);
@@ -243,15 +245,15 @@ void file::scan(mmif* mm, progress& prog,
         mm->release_until(offset);
         offset += chunk_size;
         s -= chunk_size;
+        if (pctx) {
+          pctx->bytes_processed += chunk_size;
+        }
       }
 
       cs.update(mm->as<void>(offset), s);
     }
 
     data_->hash.resize(cs.digest_size());
-
-    ++prog.hash_scans;
-    prog.hash_bytes += s;
 
     DWARFS_CHECK(cs.finalize(data_->hash.data()),
                  "checksum computation failed");
@@ -332,7 +334,7 @@ void dir::sort() {
             });
 }
 
-void dir::scan(os_access&, progress&) {}
+void dir::scan(os_access const&, progress&) {}
 
 void dir::pack_entry(thrift::metadata::metadata& mv2,
                      global_entry_data const& data) const {
@@ -425,7 +427,7 @@ const std::string& link::linkname() const { return link_; }
 
 void link::accept(entry_visitor& v, bool) { v.visit(this); }
 
-void link::scan(os_access& os, progress& prog) {
+void link::scan(os_access const& os, progress& prog) {
   link_ = u8string_to_string(os.read_symlink(fs_path()).u8string());
   prog.original_size += size();
   prog.symlink_size += size();
@@ -443,14 +445,14 @@ entry::type_t device::type() const {
 
 void device::accept(entry_visitor& v, bool) { v.visit(this); }
 
-void device::scan(os_access&, progress&) {}
+void device::scan(os_access const&, progress&) {}
 
 uint64_t device::device_id() const { return status().rdev; }
 
 class entry_factory_ : public entry_factory {
  public:
   std::shared_ptr<entry>
-  create(os_access& os, std::filesystem::path const& path,
+  create(os_access const& os, std::filesystem::path const& path,
          std::shared_ptr<entry> parent) override {
     // TODO: just use `path` directly (need to fix test helpers, tho)?
     std::filesystem::path p =

@@ -29,6 +29,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,12 +45,22 @@
 
 namespace dwarfs {
 
+class terminal;
+
 class logger {
  public:
-  enum level_type : unsigned { ERROR, WARN, INFO, DEBUG, TRACE };
+  enum level_type : unsigned {
+    FATAL,
+    ERROR,
+    WARN,
+    INFO,
+    VERBOSE,
+    DEBUG,
+    TRACE
+  };
 
   static char level_char(level_type level) {
-    static std::array<char, 5> lchars = {{'E', 'W', 'I', 'D', 'T'}};
+    static std::array<char, 7> lchars = {{'F', 'E', 'W', 'I', 'V', 'D', 'T'}};
     return lchars.at(level);
   }
 
@@ -72,15 +83,26 @@ class logger {
   }
 
   static level_type parse_level(std::string_view level);
+  static std::string_view level_name(level_type level);
+
+  static std::string all_level_names();
 
  private:
   std::string policy_name_; // TODO: const?
 };
 
+std::ostream& operator<<(std::ostream& os, logger::level_type const& optval);
+std::istream& operator>>(std::istream& is, logger::level_type& optval);
+
+struct logger_options {
+  logger::level_type threshold{logger::WARN};
+  std::optional<bool> with_context{};
+};
+
 class stream_logger : public logger {
  public:
-  stream_logger(std::ostream& os = std::cerr, level_type threshold = WARN,
-                bool with_context = false);
+  stream_logger(std::shared_ptr<terminal const> term, std::ostream& os,
+                logger_options const& options = {});
 
   void write(level_type level, const std::string& output, char const* file,
              int line) override;
@@ -89,14 +111,15 @@ class stream_logger : public logger {
   void set_with_context(bool with_context) { with_context_ = with_context; }
 
  protected:
-  virtual void preamble();
-  virtual void postamble();
+  virtual void preamble(std::ostream& os);
+  virtual void postamble(std::ostream& os);
   virtual std::string_view get_newline() const;
 
-  std::ostream& log_stream() const { return os_; }
+  void write_nolock(std::string_view output);
   std::mutex& log_mutex() const { return mx_; }
   bool log_is_colored() const { return color_; }
   level_type log_threshold() const { return threshold_.load(); }
+  terminal const& term() const { return *term_; }
 
  private:
   std::ostream& os_;
@@ -105,6 +128,14 @@ class stream_logger : public logger {
   bool const color_;
   bool const enable_stack_trace_;
   bool with_context_;
+  std::shared_ptr<terminal const> term_;
+};
+
+class null_logger : public logger {
+ public:
+  null_logger() = default;
+
+  void write(level_type, const std::string&, char const*, int) override {}
 };
 
 class level_logger {
@@ -235,6 +266,10 @@ class log_proxy {
     return LogPolicy::is_enabled_for(level);
   }
 
+  auto fatal(char const* file, int line) const {
+    return level_logger(lgr_, logger::FATAL, file, line);
+  }
+
   auto error(char const* file, int line) const {
     return typename LogPolicy::template logger_type<logger::ERROR>(
         lgr_, logger::ERROR, file, line);
@@ -248,6 +283,11 @@ class log_proxy {
   auto info(char const* file, int line) const {
     return typename LogPolicy::template logger_type<logger::INFO>(
         lgr_, logger::INFO, file, line);
+  }
+
+  auto verbose(char const* file, int line) const {
+    return typename LogPolicy::template logger_type<logger::VERBOSE>(
+        lgr_, logger::VERBOSE, file, line);
   }
 
   auto debug(char const* file, int line) const {
@@ -275,6 +315,11 @@ class log_proxy {
         lgr_, logger::INFO, file, line);
   }
 
+  auto timed_verbose(char const* file, int line) const {
+    return typename LogPolicy::template timed_logger_type<logger::VERBOSE>(
+        lgr_, logger::VERBOSE, file, line);
+  }
+
   auto timed_debug(char const* file, int line) const {
     return typename LogPolicy::template timed_logger_type<logger::DEBUG>(
         lgr_, logger::DEBUG, file, line);
@@ -298,6 +343,11 @@ class log_proxy {
   auto cpu_timed_info(char const* file, int line) const {
     return typename LogPolicy::template timed_logger_type<logger::INFO>(
         lgr_, logger::INFO, file, line, true);
+  }
+
+  auto cpu_timed_verbose(char const* file, int line) const {
+    return typename LogPolicy::template timed_logger_type<logger::VERBOSE>(
+        lgr_, logger::VERBOSE, file, line, true);
   }
 
   auto cpu_timed_debug(char const* file, int line) const {
@@ -325,23 +375,27 @@ class log_proxy {
 #define LOG_PROXY_DECL(policy) ::dwarfs::log_proxy<policy> log_
 #define LOG_PROXY_INIT(lgr) log_(lgr)
 #define LOG_GET_LOGGER log_.get_logger()
+#define LOG_FATAL log_.fatal(__FILE__, __LINE__)
 #define LOG_ERROR LOG_DETAIL_LEVEL(ERROR, log_, error)
 #define LOG_WARN LOG_DETAIL_LEVEL(WARN, log_, warn)
 #define LOG_INFO LOG_DETAIL_LEVEL(INFO, log_, info)
+#define LOG_VERBOSE LOG_DETAIL_LEVEL(VERBOSE, log_, verbose)
 #define LOG_DEBUG LOG_DETAIL_LEVEL(DEBUG, log_, debug)
 #define LOG_TRACE LOG_DETAIL_LEVEL(TRACE, log_, trace)
 #define LOG_TIMED_ERROR log_.timed_error(__FILE__, __LINE__)
 #define LOG_TIMED_WARN log_.timed_warn(__FILE__, __LINE__)
 #define LOG_TIMED_INFO log_.timed_info(__FILE__, __LINE__)
+#define LOG_TIMED_VERBOSE log_.timed_verbose(__FILE__, __LINE__)
 #define LOG_TIMED_DEBUG log_.timed_debug(__FILE__, __LINE__)
 #define LOG_TIMED_TRACE log_.timed_trace(__FILE__, __LINE__)
 #define LOG_CPU_TIMED_ERROR log_.cpu_timed_error(__FILE__, __LINE__)
 #define LOG_CPU_TIMED_WARN log_.cpu_timed_warn(__FILE__, __LINE__)
 #define LOG_CPU_TIMED_INFO log_.cpu_timed_info(__FILE__, __LINE__)
+#define LOG_CPU_TIMED_VERBOSE log_.cpu_timed_verbose(__FILE__, __LINE__)
 #define LOG_CPU_TIMED_DEBUG log_.cpu_timed_debug(__FILE__, __LINE__)
 #define LOG_CPU_TIMED_TRACE log_.cpu_timed_trace(__FILE__, __LINE__)
 
-class prod_logger_policy : public MinimumLogLevelPolicy<logger::INFO> {
+class prod_logger_policy : public MinimumLogLevelPolicy<logger::VERBOSE> {
  public:
   static std::string name() { return "prod"; }
 };

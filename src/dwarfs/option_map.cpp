@@ -22,50 +22,63 @@
 #include <algorithm>
 #include <vector>
 
-#include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/join.hpp>
-#include <boost/algorithm/string/split.hpp>
+#include <fmt/format.h>
+
+#include <folly/String.h>
 
 #include "dwarfs/error.h"
 #include "dwarfs/option_map.h"
-#include "dwarfs/program_options_helpers.h"
+#include "dwarfs/util.h"
 
 namespace dwarfs {
 
 option_map::option_map(const std::string_view spec) {
-
-  auto arg = split(spec,':');
-
-//  https://stackoverflow.com/questions/45211248/boosts-is-any-of-causes-compile-warning
-//  std::vector<std::string_view> arg;
-//  boost::split(arg, spec, boost::is_any_of(std::string(":")));
+  std::vector<std::string_view> arg;
+  folly::split(':', spec, arg);
 
   choice_ = arg[0];
 
   for (size_t i = 1; i < arg.size(); ++i) {
-      auto kv = split(arg[i], '=');
+    std::string key;
+    std::string val;
 
-//    https://stackoverflow.com/questions/45211248/boosts-is-any-of-causes-compile-warning
-//    std::vector<std::string> kv;
-//    boost::split(kv, arg[i], boost::is_any_of(std::string("=")));
-
-    if (kv.size() > 2) {
-      DWARFS_THROW(runtime_error,
-                   "error parsing option " + kv[0] + " for choice " + choice_);
+    if (auto eqpos = arg[i].find('='); eqpos != std::string_view::npos) {
+      key.assign(arg[i].substr(0, eqpos));
+      val.assign(arg[i].substr(eqpos + 1));
+    } else {
+      key.assign(arg[i]);
+      val.assign("1");
     }
 
-    opt_[kv[0]] = kv.size() > 1 ? kv[1] : std::string("1");
+    if (!opt_.emplace(key, val).second) {
+      DWARFS_THROW(
+          runtime_error,
+          fmt::format("duplicate option {} for choice {}", key, choice_));
+    }
   }
+}
+
+size_t option_map::get_size(const std::string& key, size_t default_value) {
+  auto i = opt_.find(key);
+
+  if (i != opt_.end()) {
+    std::string val = i->second;
+    opt_.erase(i);
+    return parse_size_with_unit(val);
+  }
+
+  return default_value;
 }
 
 void option_map::report() {
   if (!opt_.empty()) {
     std::vector<std::string> invalid;
-    std::transform(
-        opt_.begin(), opt_.end(), std::back_inserter(invalid),
-        [](const std::pair<std::string, std::string>& p) { return p.first; });
-    DWARFS_THROW(runtime_error, "invalid option(s) for choice " + choice_ +
-                                    ": " + boost::join(invalid, ", "));
+    std::transform(opt_.begin(), opt_.end(), std::back_inserter(invalid),
+                   [](const auto& p) { return p.first; });
+    std::sort(invalid.begin(), invalid.end());
+    DWARFS_THROW(runtime_error,
+                 fmt::format("invalid option(s) for choice {}: {}", choice_,
+                             fmt::join(invalid, ", ")));
   }
 }
 

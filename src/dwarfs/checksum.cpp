@@ -23,6 +23,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <ostream>
 #include <unordered_set>
 
 #include <openssl/evp.h>
@@ -165,6 +166,17 @@ class checksum_xxh3_128 : public checksum::impl {
   XXH3_state_t* state_;
 };
 
+template <typename T>
+bool verify_impl(T&& alg, void const* data, size_t size, const void* digest,
+                 size_t digest_size) {
+  std::array<char, EVP_MAX_MD_SIZE> tmp;
+  checksum cs(std::forward<T>(alg));
+  DWARFS_CHECK(digest_size == cs.digest_size(), "digest size mismatch");
+  cs.update(data, size);
+  return cs.finalize(tmp.data()) &&
+         ::memcmp(digest, tmp.data(), digest_size) == 0;
+}
+
 } // namespace
 
 bool checksum::is_available(std::string const& algo) {
@@ -183,19 +195,16 @@ std::vector<std::string> checksum::available_algorithms() {
 
 bool checksum::verify(algorithm alg, void const* data, size_t size,
                       const void* digest, size_t digest_size) {
-  std::array<char, EVP_MAX_MD_SIZE> tmp;
-  checksum cs(alg);
-  DWARFS_CHECK(digest_size == cs.digest_size(), "digest size mismatch");
-  cs.update(data, size);
-  return cs.finalize(tmp.data()) &&
-         ::memcmp(digest, tmp.data(), digest_size) == 0;
+  return verify_impl(alg, data, size, digest, digest_size);
+}
+
+bool checksum::verify(std::string const& alg, void const* data, size_t size,
+                      const void* digest, size_t digest_size) {
+  return verify_impl(alg, data, size, digest, digest_size);
 }
 
 checksum::checksum(algorithm alg) {
   switch (alg) {
-  case algorithm::SHA1:
-    impl_ = std::make_unique<checksum_evp>(::EVP_sha1());
-    break;
   case algorithm::SHA2_512_256:
     impl_ = std::make_unique<checksum_evp>(::EVP_sha512_256());
     break;
@@ -223,10 +232,22 @@ checksum::checksum(std::string const& alg) {
   }
 }
 
-bool checksum::verify(void const* digest) const {
-  std::array<char, EVP_MAX_MD_SIZE> tmp;
-  return impl_->finalize(tmp.data()) &&
-         ::memcmp(digest, tmp.data(), impl_->digest_size()) == 0;
+std::ostream& operator<<(std::ostream& os, checksum::algorithm alg) {
+  switch (alg) {
+  case checksum::algorithm::SHA2_512_256:
+    os << "SHA2_512_256";
+    break;
+  case checksum::algorithm::XXH3_64:
+    os << "XXH3_64";
+    break;
+  case checksum::algorithm::XXH3_128:
+    os << "XXH3_128";
+    break;
+  default:
+    os << "<unknown>";
+    break;
+  }
+  return os;
 }
 
 } // namespace dwarfs

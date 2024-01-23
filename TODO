@@ -1,6 +1,69 @@
-- Forward compatibility
+- Add support for compressing uncompressed image formats,
+  currently primarily FITS, using different formats (e.g.
+  JPEG2K, Rice, Hcompress).
 
-  - Feature flags (feature strings)
+- Fragment counts don't necessarily match up in presence
+  of errors.
+
+- When opening a file again, check that its timestamp,
+  size and potentially checksum did not change from
+  when we first saw it.
+
+- Option to log to a file instead of stderr?
+
+- Use thrift definitions for all options to make them
+  easily printable/storable?
+
+- Use Elias-Fano for delta-encoded lists in metadata?
+
+- Implement rewriting properly; keep order of blocks etc;
+  ability to remove history?; ability to re-pack metadata?;
+  ability to change other metadata properties (e.g. stuff
+  like --set-owner, --set-group, --chmod, --no-create-ts,
+  --set-time could all be done on existing metadata, but
+  obviously wouldn't be undo-able)
+
+- Packaging of libs added via FetchContent
+
+- Re-assemble global bloom filter rather than merging?
+- Use smaller bloom filters for individual blocks?
+- Use bigger (non-resettable?) global bloom filter?
+
+- file discovery progress?
+
+- show defaults for categorized options
+
+- take a look at CPU measurements, those for nilsimsa
+  ordering are probably wrong
+
+- segmenter tests with different granularities, block sizes,
+  any other options
+
+- Bloom filters can be wasteful if lookback gets really long.
+  Maybe we can use smaller bloom filters for individual blocks
+  and one or two larger "global" bloom filters? It's going to
+  be impossible to rebuild those from the smaller filters,
+  though.
+
+- Compress long repetitions of the same byte more efficiently.
+  Currently, segmentation finds an overlap after about one
+  window size. This goes on and on repeatedly. So we end up
+  with a *lot* of chunks pointing to the same segment. The
+  smaller the window size, the larger the number of chunks.
+  It's definitely a trade off, as storing large segments of
+  repeating bytes is wasteful when mounting the image.
+
+  Intriguing idea: pre-compute 256 (or just 2, for 0x00 and 0xFF)
+  hash values for window_size bytes to detect long sequences of
+  identical bytes.
+
+  OTHER intriguing idea: let a categorizer (could even be the
+  incompressible categorizer, but also "sparse file" categorizer
+  or something like that) detect these repetitions up front so
+  the segmenter doesn't have to do it (and it can be optional).
+  Then, we can customize the segmenter to run *extremely* fast
+  in this case.
+
 
 - Wiki with use cases
   - Perl releases
@@ -9,77 +72,6 @@
   - Compression of filesystem images for forensic purposes
 
 - Mounting lots of images with shared cache?
-
-inode -> list of fragments
-
-categorizer returns list of fragments OR single category
-
-fragment -> [offset, length, category]
-
-
-
-TODO: with PCM audio signals, we need to categorize by:
-
-      - # of channels
-      - bit depth
-      - endian-ness
-      - signed-ness
-      - sample rate (not necessarily)
-
-      we also need to keep track of endian-ness and signed-ness
-      outside of the FLAC stream, as this information isn't
-      stored in FLAC; we could always get this information from
-      the metadata of the original file, but that would be a lot
-      more complicated than just storing two extra bits in the
-      block itself; we'll have to store the decoded length as
-      well, so this won't make a real difference
-
-- how do we make multiple parallel block chains (categories)
-  reproducible?
-
-    => we could re-write the blocks and update the metadata;
-       however, data added to "uncategorized" blocks would
-       still be random
-
-    => oooh, easy: we can order all chunks before we start
-       writing them to blocks, so only the block order is
-       random after all, which we can fix by rewriting.
-       the tricky bit is (probably) going to be updating
-       the chunks in the metadata, as they won't be written
-       to the individual blocks sequentially; pretty sure
-       that's a solvable problem.
-
-    => indeed solvable; chunks aren't finalized until after
-       all blocks have been written. We simply need to subdivide
-       `inode_`s into smaller parts (as provided by the categorizer)
-       and then add chunks to the individual parts, assembling them
-       only after everything has been written
-
-    => as for re-writing the blocks: we need to keep track of
-       the category of each block, so that we can later sort
-       the blocks by category; we can do this in a separate
-       section, which can later be deleted; or we can even keep
-       it if we want to know later on what category a block
-       belonged to
-
-- configuration ideas:
-
-  --order FILETYPE::...
-  -B FILETYPE::...
-  -W FILETYPE::...
-  -w FILETYPE::...
-  -C FILETYPE::...
-
-  -B pcmaudio::64 -W pcmaudio::16 -C pcmaudio::flac:level=8
-  -C binary/x86::zstd:filter=x86
-  -C mime:application/x-archive::null
-
-  --filetype pcmaudio::mime:audio/x-wav,mime:audio/x-w64
-
-
-  --categorize=pcmaudio,incompressible,binary,libmagic
-  --libmagic-types=application/x-archive
-
 
 - different scenarios for categorized files / chunks:
 
@@ -98,11 +90,9 @@ TODO: with PCM audio signals, we need to categorize by:
     This is actually quite easy:
 
     - Identify PCM audio files (libmagic?)
-    - Use libsndfile for parsing
     - Nilsimsa similarity works surprisingly well
     - We can potentially switch to larger window size for segmentation and use
       larger lookback
-    - Group by format (# of channels, resolution, endian-ness, signedness, sample rate)
     - Run segmentation as usual
     - Compress each block using FLAC (hopefully we can configure how much header data
       and/or seek points etc. gets stored) or maybe even WAVPACK is we don't need perf
@@ -159,18 +149,12 @@ TODO: with PCM audio signals, we need to categorize by:
       would only operate on a few instead of all bloom filters, which
       could be better from a cache locality pov)
 
-- per-file progress for large files?
-- throughput indicator
-
 - similarity size limit to avoid similarity computation for huge files
 - store files without similarity hash first, sorted descending by size
-- allow ordering by *reverse* path
 
 
 - use streaming interface for zstd decompressor
 - json metadata recovery
-- add --chmod, --chown
-- add some simple filter rules?
 - handle sparse files?
 - try to be more resilient to modifications of the input while creating fs
 
@@ -196,8 +180,6 @@ TODO: with PCM audio signals, we need to categorize by:
 - --unpack option
 
 - readahead?
-
-- remove multiple blockhash window sizes, one is enough apparently?
 
 - window-increment-shift seems silly to configure?
 

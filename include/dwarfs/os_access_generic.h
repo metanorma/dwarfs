@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "dwarfs/os_access.h"
@@ -34,13 +35,25 @@ class mmif;
 
 class os_access_generic : public os_access {
  public:
-  std::shared_ptr<dir_reader>
+  std::unique_ptr<dir_reader>
   opendir(std::filesystem::path const& path) const override;
   file_stat symlink_info(std::filesystem::path const& path) const override;
   std::filesystem::path
   read_symlink(std::filesystem::path const& path) const override;
-  std::shared_ptr<mmif>
+  std::unique_ptr<mmif>
+  map_file(std::filesystem::path const& path) const override;
+  std::unique_ptr<mmif>
   map_file(std::filesystem::path const& path, size_t size) const override;
   int access(std::filesystem::path const& path, int mode) const override;
+  std::filesystem::path
+  canonical(std::filesystem::path const& path) const override;
+  std::filesystem::path current_path() const override;
+  std::optional<std::string> getenv(std::string_view name) const override;
+  void thread_set_affinity(std::thread::id tid, std::span<int const> cpus,
+                           std::error_code& ec) const override;
+  std::chrono::nanoseconds
+  thread_get_cpu_time(std::thread::id tid, std::error_code& ec) const override;
+  std::filesystem::path
+  find_executable(std::filesystem::path const& name) const override;
 };
 } // namespace dwarfs

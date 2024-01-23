@@ -21,15 +21,34 @@
 
 #pragma once
 
-#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 
-#include "dwarfs/entry_transformer.h"
+#include "dwarfs/file_stat.h"
 
 namespace dwarfs {
 
-std::unique_ptr<entry_transformer>
-create_chmod_transformer(std::string_view spec, uint16_t umask);
+class chmod_transformer {
+ public:
+  using mode_type = file_stat::mode_type;
+
+  chmod_transformer(std::string_view spec, mode_type umask);
+
+  std::optional<mode_type> transform(mode_type mode, bool isdir) const {
+    return impl_->transform(mode, isdir);
+  }
+
+  class impl {
+   public:
+    virtual ~impl() = default;
+
+    virtual std::optional<mode_type>
+    transform(mode_type mode, bool isdir) const = 0;
+  };
+
+ private:
+  std::unique_ptr<impl> impl_;
+};
 
 } // namespace dwarfs

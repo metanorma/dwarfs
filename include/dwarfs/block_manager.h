@@ -21,45 +21,31 @@
 
 #pragma once
 
-#include <cstddef>
-#include <memory>
+#include <mutex>
+#include <optional>
 #include <vector>
+
+#include "dwarfs/fragment_category.h"
+#include "dwarfs/gen-cpp2/metadata_types.h"
 
 namespace dwarfs {
 
-class filesystem_writer;
-class inode;
-class logger;
-class os_access;
-class progress;
-
 class block_manager {
  public:
-  struct config {
-    unsigned blockhash_window_size;
-    unsigned window_increment_shift{1};
-    size_t max_active_blocks{1};
-    size_t memory_limit{256 << 20};
-    unsigned block_size_bits{22};
-    unsigned bloom_filter_size{4};
-  };
+  using chunk_type = thrift::metadata::chunk;
 
-  block_manager(logger& lgr, progress& prog, const config& cfg,
-                std::shared_ptr<os_access> os, filesystem_writer& fsw);
-
-  void add_inode(std::shared_ptr<inode> ino) { impl_->add_inode(ino); }
-
-  void finish_blocks() { impl_->finish_blocks(); }
-
-  class impl {
-   public:
-    virtual ~impl() = default;
-
-    virtual void add_inode(std::shared_ptr<inode> ino) = 0;
-    virtual void finish_blocks() = 0;
-  };
+  size_t get_logical_block() const;
+  void set_written_block(size_t logical_block, size_t written_block,
+                         fragment_category::value_type category);
+  void map_logical_blocks(std::vector<chunk_type>& vec);
+  std::vector<fragment_category::value_type>
+  get_written_block_categories() const;
 
  private:
-  std::unique_ptr<impl> impl_;
+  std::mutex mutable mx_;
+  size_t mutable num_blocks_{0};
+  std::vector<std::optional<std::pair<size_t, fragment_category::value_type>>>
+      block_map_;
 };
+
 } // namespace dwarfs

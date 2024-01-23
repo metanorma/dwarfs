@@ -22,8 +22,10 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "dwarfs/fstypes.h"
 
@@ -40,11 +42,14 @@ class fs_section {
 
   size_t start() const { return impl_->start(); }
   size_t length() const { return impl_->length(); }
+  bool is_known_compression() const { return impl_->is_known_compression(); }
+  bool is_known_type() const { return impl_->is_known_type(); }
   compression_type compression() const { return impl_->compression(); }
   section_type type() const { return impl_->type(); }
   std::string name() const { return impl_->name(); }
   std::string description() const { return impl_->description(); }
   bool check_fast(mmif const& mm) const { return impl_->check_fast(mm); }
+  bool check(mmif const& mm) const { return impl_->check(mm); }
   bool verify(mmif const& mm) const { return impl_->verify(mm); }
   std::span<uint8_t const> data(mmif const& mm) const {
     return impl_->data(mm);
@@ -52,19 +57,37 @@ class fs_section {
 
   size_t end() const { return start() + length(); }
 
+  std::optional<uint32_t> section_number() const {
+    return impl_->section_number();
+  }
+
+  std::optional<uint64_t> xxh3_64_value() const {
+    return impl_->xxh3_64_value();
+  }
+
+  std::optional<std::vector<uint8_t>> sha2_512_256_value() const {
+    return impl_->sha2_512_256_value();
+  }
+
   class impl {
    public:
     virtual ~impl() = default;
 
     virtual size_t start() const = 0;
     virtual size_t length() const = 0;
+    virtual bool is_known_compression() const = 0;
+    virtual bool is_known_type() const = 0;
     virtual compression_type compression() const = 0;
     virtual section_type type() const = 0;
     virtual std::string name() const = 0;
     virtual std::string description() const = 0;
     virtual bool check_fast(mmif const& mm) const = 0;
+    virtual bool check(mmif const& mm) const = 0;
     virtual bool verify(mmif const& mm) const = 0;
     virtual std::span<uint8_t const> data(mmif const& mm) const = 0;
+    virtual std::optional<uint32_t> section_number() const = 0;
+    virtual std::optional<uint64_t> xxh3_64_value() const = 0;
+    virtual std::optional<std::vector<uint8_t>> sha2_512_256_value() const = 0;
   };
 
  private:

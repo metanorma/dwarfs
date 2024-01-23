@@ -29,39 +29,34 @@
 #include <string>
 
 #include "dwarfs/logger.h"
-#include "dwarfs/speedometer.h"
 
 namespace dwarfs {
 
 class progress;
+class terminal;
 
 class console_writer : public stream_logger {
  public:
-  using get_term_width_type = std::function<size_t()>;
-
   enum display_mode { NORMAL, REWRITE };
   enum progress_mode { NONE, SIMPLE, ASCII, UNICODE };
 
-  console_writer(std::ostream& os, progress_mode pg_mode,
-                 get_term_width_type get_term_width, level_type threshold,
-                 display_mode mode = NORMAL, bool verbose = false);
+  console_writer(std::shared_ptr<terminal const> term, std::ostream& os,
+                 progress_mode pg_mode, display_mode mode = NORMAL,
+                 logger_options const& options = {});
 
-  void update(const progress& p, bool last);
+  void update(progress& p, bool last);
 
  private:
-  void preamble() override;
-  void postamble() override;
+  void preamble(std::ostream& os) override;
+  void postamble(std::ostream& os) override;
   std::string_view get_newline() const override;
-  void rewind();
+  void rewind(std::ostream& os, int next_rewind_lines);
 
   std::string statebuf_;
+  int rewind_lines_{0};
   double frac_;
   std::atomic<size_t> counter_{0};
   progress_mode const pg_mode_;
-  get_term_width_type get_term_width_;
   display_mode const mode_;
-  bool const debug_progress_;
-  bool writing_{false};
-  speedometer<uint64_t> read_speed_;
 };
 } // namespace dwarfs

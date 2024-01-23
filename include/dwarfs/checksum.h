@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <iosfwd>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,7 +35,6 @@ namespace dwarfs {
 class checksum {
  public:
   enum class algorithm {
-    SHA1,
     SHA2_512_256,
     XXH3_64,
     XXH3_128,
@@ -44,6 +44,8 @@ class checksum {
   static std::vector<std::string> available_algorithms();
 
   static bool verify(algorithm alg, void const* data, size_t size,
+                     void const* digest, size_t digest_size);
+  static bool verify(std::string const& alg, void const* data, size_t size,
                      void const* digest, size_t digest_size);
 
   checksum(algorithm alg);
@@ -55,8 +57,6 @@ class checksum {
   }
 
   bool finalize(void* digest) const { return impl_->finalize(digest); }
-
-  bool verify(void const* digest) const;
 
   size_t digest_size() const { return impl_->digest_size(); }
 
@@ -72,5 +72,7 @@ class checksum {
  private:
   std::unique_ptr<impl> impl_;
 };
+
+std::ostream& operator<<(std::ostream& os, checksum::algorithm alg);
 
 } // namespace dwarfs

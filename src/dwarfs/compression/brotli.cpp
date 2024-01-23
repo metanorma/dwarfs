@@ -50,7 +50,8 @@ class brotli_block_compressor final : public block_compressor::impl {
   }
 
   std::vector<uint8_t>
-  compress(const std::vector<uint8_t>& data) const override {
+  compress(const std::vector<uint8_t>& data,
+           std::string const* /*metadata*/) const override {
     std::vector<uint8_t> compressed;
     compressed.resize(folly::kMaxVarintLength64 +
                       ::BrotliEncoderMaxCompressedSize(data.size()));
@@ -69,11 +70,23 @@ class brotli_block_compressor final : public block_compressor::impl {
     return compressed;
   }
 
-  std::vector<uint8_t> compress(std::vector<uint8_t>&& data) const override {
-    return compress(data);
+  std::vector<uint8_t> compress(std::vector<uint8_t>&& data,
+                                std::string const* metadata) const override {
+    return compress(data, metadata);
   }
 
   compression_type type() const override { return compression_type::BROTLI; }
+
+  std::string describe() const override {
+    return fmt::format("brotli [quality={}, lgwin={}]", quality_, window_bits_);
+  }
+
+  std::string metadata_requirements() const override { return std::string(); }
+
+  compression_constraints
+  get_compression_constraints(std::string const&) const override {
+    return compression_constraints();
+  }
 
  private:
   uint32_t const quality_;
@@ -113,6 +126,8 @@ class brotli_block_decompressor final : public block_decompressor::impl {
   }
 
   compression_type type() const override { return compression_type::BROTLI; }
+
+  std::optional<std::string> metadata() const override { return std::nullopt; }
 
   bool decompress_frame(size_t frame_size) override {
     size_t pos = decompressed_.size();
@@ -168,7 +183,13 @@ class brotli_compression_factory : public compression_factory {
 
   std::string_view name() const override { return "brotli"; }
 
-  std::string_view description() const override { return "Brotli compression"; }
+  std::string_view description() const override {
+    static std::string const s_desc{
+        fmt::format("Brotli compression (encoder {}, decoder {})",
+                    version_string(::BrotliEncoderVersion()),
+                    version_string(::BrotliDecoderVersion()))};
+    return s_desc;
+  }
 
   std::vector<std::string> const& options() const override { return options_; }
 
@@ -187,6 +208,10 @@ class brotli_compression_factory : public compression_factory {
   }
 
  private:
+  static std::string version_string(uint32_t hex) {
+    return fmt::format("{}.{}.{}", hex >> 24, (hex >> 12) & 0xFFF, hex & 0xFFF);
+  }
+
   std::vector<std::string> const options_;
 };
 

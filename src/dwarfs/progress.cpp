@@ -19,6 +19,7 @@
  * along with dwarfs.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -29,7 +30,7 @@
 
 namespace dwarfs {
 
-progress::progress(folly::Function<void(const progress&, bool)>&& func,
+progress::progress(folly::Function<void(progress&, bool)>&& func,
                    unsigned interval_ms)
     : running_(true)
     , thread_([this, interval_ms, func = std::move(func)]() mutable {
@@ -37,7 +38,7 @@ progress::progress(folly::Function<void(const progress&, bool)>&& func,
 #ifdef _WIN32
       ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
-      std::unique_lock lock(mx_);
+      std::unique_lock lock(running_mx_);
       while (running_) {
         func(*this, false);
         cond_.wait_for(lock, std::chrono::milliseconds(interval_ms));
@@ -48,21 +49,61 @@ progress::progress(folly::Function<void(const progress&, bool)>&& func,
 
 progress::~progress() noexcept {
   try {
-    running_ = false;
+    {
+      std::lock_guard lock(running_mx_);
+      running_ = false;
+    }
     cond_.notify_all();
     thread_.join();
   } catch (...) {
   }
 }
 
-void progress::set_status_function(status_function_type status_fun) {
-  std::unique_lock lock(mx_);
-  status_fun_ = std::move(status_fun);
+void progress::add_context(std::shared_ptr<context> const& ctx) const {
+  std::lock_guard lock(mx_);
+  contexts_.push_back(ctx);
 }
 
-std::string progress::status(size_t max_len) const {
-  if (status_fun_) {
-    return status_fun_(*this, max_len);
+auto progress::get_active_contexts() const
+    -> std::vector<std::shared_ptr<context>> {
+  std::vector<std::shared_ptr<context>> rv;
+
+  rv.reserve(16);
+
+  {
+    std::lock_guard lock(mx_);
+
+    contexts_.erase(std::remove_if(contexts_.begin(), contexts_.end(),
+                                   [&rv](auto& wp) {
+                                     if (auto sp = wp.lock()) {
+                                       rv.push_back(std::move(sp));
+                                       return false;
+                                     }
+                                     return true;
+                                   }),
+                    contexts_.end());
+  }
+
+  std::stable_sort(rv.begin(), rv.end(), [](const auto& a, const auto& b) {
+    return a->get_priority() > b->get_priority();
+  });
+
+  return rv;
+}
+
+void progress::set_status_function(status_function_type status_fun) {
+  std::lock_guard lock(mx_);
+  status_fun_ = std::make_shared<status_function_type>(std::move(status_fun));
+}
+
+std::string progress::status(size_t max_len) {
+  std::shared_ptr<status_function_type> fun;
+  {
+    std::lock_guard lock(mx_);
+    fun = status_fun_;
+  }
+  if (fun) {
+    return (*fun)(*this, max_len);
   }
   return std::string();
 }

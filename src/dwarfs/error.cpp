@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <iostream>
 
+#include <fmt/format.h>
+
 #include <folly/String.h>
 
 #ifdef DWARFS_USE_EXCEPTION_TRACER
@@ -32,8 +34,26 @@
 
 #include "dwarfs/error.h"
 #include "dwarfs/terminal.h"
+#include "dwarfs/util.h"
 
 namespace dwarfs {
+
+namespace {
+
+[[noreturn]] void do_terminate() {
+#ifdef DWARFS_COVERAGE_ENABLED
+  std::exit(99);
+#else
+  std::terminate();
+#endif
+}
+
+} // namespace
+
+error::error(std::string const& s, char const* file, int line) noexcept
+    : what_{fmt::format("{} [{}:{}]", s, basename(file), line)}
+    , file_{file}
+    , line_{line} {}
 
 system_error::system_error(char const* file, int line) noexcept
     : system_error(errno, file, line) {}
@@ -68,14 +88,14 @@ void handle_nothrow(char const* expr, char const* file, int line) {
   std::cerr << "Expression `" << expr << "` threw `"
             << folly::exceptionStr(std::current_exception()) << "` in " << file
             << "(" << line << ")\n";
-  ::abort();
+  do_terminate();
 }
 
 void assertion_failed(char const* expr, std::string const& msg,
                       char const* file, int line) {
   std::cerr << "Assertion `" << expr << "` failed in " << file << "(" << line
             << "): " << msg << "\n";
-  ::abort();
+  do_terminate();
 }
 
 } // namespace dwarfs

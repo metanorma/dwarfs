@@ -23,6 +23,8 @@ include "thrift/annotation/cpp.thrift"
 
 namespace cpp2 dwarfs.thrift.metadata
 
+@cpp.Type{name = "uint8_t"}
+typedef byte UInt8
 @cpp.Type{name = "uint16_t"}
 typedef i16 UInt16
 @cpp.Type{name = "uint32_t"}
@@ -127,7 +129,7 @@ struct dir_entry {
    // index into metadata.names
    1: UInt32 name_index
 
-   // index into metadata.entries
+   // index into metadata.inodes
    2: UInt32 inode_num
 }
 
@@ -350,6 +352,40 @@ struct metadata {
 
   25: optional string_table     compact_symlinks
 
+  //=========================================================//
+  // fields added with dwarfs-0.7.0, file system version 2.5 //
+  //=========================================================//
+
    // preferred path separator of original file system
   26: optional UInt32           preferred_path_separator
+
+  //=========================================================//
+  // fields added with dwarfs-0.7.3, file system version 2.5 //
+  //=========================================================//
+
+  // We don't need to increment the file system minor version
+  // as file systems created with this new version are still
+  // readable by older binaries as long as they don't use any
+  // unsupported features (e.g. FLAC compression).
+
+  // The set of features used in this file system image. As long
+  // as an older binary supports all features, it will be able
+  // to use images created with newer versions. We use strings
+  // here instead of an enum so older versions can still output
+  // names of features used by a newer version.
+  27: optional set<string>      features
+
+  //=========================================================//
+  // fields added with dwarfs-0.8.0, file system version 2.5 //
+  //=========================================================//
+
+  // The set of categories used in this file system image. Used
+  // for displaying and to select compression algorithms when
+  // recompressing the image.
+  28: optional list<string>     category_names
+
+  // The category of each block in the file system image. The
+  // index into this vector is the block number and the value
+  // is an index into `category_names`.
+  29: optional list<UInt32>     block_categories
 }

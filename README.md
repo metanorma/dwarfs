@@ -32,16 +32,21 @@ A fast high compression read-only file system for Linux and Windows.
   - [Windows Support](#windows-support)
     - [Building on Windows](#building-on-windows)
   - [Extended Attributes](#extended-attributes)
+    - [Preserving Extended Attributes in DwarFS Images](#preserving-extended-attributes-in-dwarfs-images)
+    - [Extended Attributes exposed by the FUSE Driver](#extended-attributes-exposed-by-the-fuse-driver)
   - [Comparison](#comparison)
     - [With SquashFS](#with-squashfs)
     - [With SquashFS \& xz](#with-squashfs--xz)
     - [With lrzip](#with-lrzip)
     - [With zpaq](#with-zpaq)
+    - [With zpaqfranz](#with-zpaqfranz)
     - [With wimlib](#with-wimlib)
     - [With Cromfs](#with-cromfs)
     - [With EROFS](#with-erofs)
     - [With fuse-archive](#with-fuse-archive)
   - [Performance Monitoring](#performance-monitoring)
+  - [Other Obscure Features](#other-obscure-features)
+    - [Setting Worker Thread CPU Affinity](#setting-worker-thread-cpu-affinity)
 
 ## Overview
 
@@ -113,6 +118,12 @@ Distinct features of DwarFS are:
   the size of the uncompressed file system. This saves memory when
   using the compressed file system and thus potentially allows for
   higher cache hit rates as more data can be kept in the cache.
+
+- [Categorization framework](doc/mkdwarfs.md#categorizers) to categorize
+  files or even fragments of files and then process individual categories
+  differently. For example, this allows you to not waste time trying to
+  compress incompressible files or to compress PCM audio data using FLAC
+  compression.
 
 - Highly multi-threaded implementation. Both the
   [file system creation tool](doc/mkdwarfs.md) as well as the
@@ -269,6 +280,7 @@ $ apt install \
     libboost-thread-dev \
     libbrotli-dev \
     libevent-dev \
+    libhowardhinnant-date-dev \
     libjemalloc-dev \
     libdouble-conversion-dev \
     libiberty-dev \
@@ -281,8 +293,10 @@ $ apt install \
     libelf-dev \
     libfmt-dev \
     libfuse3-dev \
+    libgoogle-glog-dev \
     libutfcpp-dev \
-    libgoogle-glog-dev
+    libflac++-dev \
+    python3-mistletoe
 ```
 
 Note that when building with `gcc`, the optimization level will be
@@ -384,17 +398,25 @@ $ ninja test
 
 ## Usage
 
-Please check out the man pages for [mkdwarfs](doc/mkdwarfs.md),
+Please check out the manual pages for [mkdwarfs](doc/mkdwarfs.md),
 [dwarfs](doc/dwarfs.md), [dwarfsck](doc/dwarfsck.md) and
-[dwarfsextract](doc/dwarfsextract.md).
+[dwarfsextract](doc/dwarfsextract.md). You can also access the manual
+pages using the `--man` option to each binary, e.g.:
 
-The [dwarfs](doc/dwarfs.md) man page also shows an example for setting
+```
+$ mkdwarfs --man
+```
+
+The [dwarfs](doc/dwarfs.md) manual page also shows an example for setting
 up DwarFS with [overlayfs](https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt)
 in order to create a writable file system mount on top a read-only
 DwarFS image.
 
 A description of the DwarFS filesystem format can be found in
 [dwarfs-format](doc/dwarfs-format.md).
+
+A high-level overview of the internal operation of `mkdwarfs` is shown
+in [this sequence diagram](doc/mkdwarfs-sequence.svg).
 
 ## Windows Support
 
@@ -498,9 +520,13 @@ your machine.
 
 ## Extended Attributes
 
+### Preserving Extended Attributes in DwarFS Images
+
 Extended attributes are not currently supported. Any extended attributes
 stored in the source file system will not currently be preserved when
 building a DwarFS image using `mkdwarfs`.
+
+### Extended Attributes exposed by the FUSE Driver
 
 That being said, the root inode of a mounted DwarFS image currently exposes
 one or two extended attributes on Linux:
@@ -514,6 +540,51 @@ Attribute "dwarfs.driver.perfmon" has a 4849 byte value for mnt
 The `dwarfs.driver.pid` attribute simply contains the PID of the DwarFS
 FUSE driver. The `dwarfs.driver.perfmon` attribute contains the current
 results of the [performance monitor](#performance-monitoring).
+
+Furthermore, each regular file exposes an attribute `dwarfs.inodeinfo`
+with information about the undelying inode:
+
+```
+$ attr -l "05 Disappear.caf"
+Attribute "dwarfs.inodeinfo" has a 448 byte value for 05 Disappear.caf
+```
+
+The attribute contains a JSON object with information about the
+underlying inode:
+
+```
+$ attr -qg dwarfs.inodeinfo "05 Disappear.caf"
+{
+  "chunks": [
+    {
+      "block": 2,
+      "category": "pcmaudio/metadata",
+      "offset": 270976,
+      "size": 4096
+    },
+    {
+      "block": 414,
+      "category": "pcmaudio/waveform",
+      "offset": 37594368,
+      "size": 29514492
+    },
+    {
+      "block": 419,
+      "category": "pcmaudio/waveform",
+      "offset": 0,
+      "size": 29385468
+    }
+  ],
+  "gid": 100,
+  "mode": 33188,
+  "modestring": "----rw-r--r--",
+  "uid": 1000
+}
+```
+
+This is useful, for example, to check how a particular file is spread
+across multiple blocks or which categories have been assigned to the
+file.
 
 ## Comparison
 
@@ -1241,6 +1312,110 @@ sys     3m47.876s
 ```
 
 That's 700 times slower than extracting the DwarFS image.
+
+### With zpaqfranz
+
+[zpaqfranz](https://github.com/fcorbelli/zpaqfranz) is a derivative of zpaq.
+Much to my delight, it doesn't generate millions of lines of output.
+It claims to be multi-threaded and de-duplicating, so definitely worth
+taking a look. Like zpaq, it supports incremental backups.
+
+We'll use a different input to compare zpaqfranz and DwarFS: The source code
+of 670 different releases of the "wine" emulator. That's 73 gigabytes of data
+in total, spread across slightly more than 3 million files. It's obviously
+highly redundant and should thus be a good data set to compare the tools.
+For reference, a `.tar.xz` of the directory is still 7 GiB in size and a
+SquashFS image of the data gets down to around 1.6 GiB. An "optimized"
+`.tar.xz`, where the input files were ordered by similarity, compresses down
+to 399 MiB, almost 20 times better than without ordering.
+
+Now it's time to try zpaqfranz. The input data is stored on a fast SSD and a
+large fraction of it is already in the file system cache from previous runs,
+so disk I/O is not a bottleneck.
+
+```
+$ time ./zpaqfranz a winesrc.zpaq winesrc
+zpaqfranz v58.8k-JIT-L(2023-08-05)
+Creating winesrc.zpaq at offset 0 + 0
+Add 2024-01-11 07:25:22 3.117.413     69.632.090.852 (  64.85 GB) 16T (362.904 dirs)
+3.480.317 +added, 0 -removed.
+
+0 + (69.632.090.852 -> 8.347.553.798 -> 617.600.892) = 617.600.892 @ 58.38 MB/s
+
+1137.441 seconds (000:18:57) (all OK)
+
+real    18m58.632s
+user    11m51.052s
+sys     1m3.389s
+```
+
+That is considerably faster than the original zpaq, and uses about 60 times
+less CPU resources. The output file is 589 MiB, so slightly larger than both
+the "optimized" `.tar.gz` and the zpaq output.
+
+How does `mkdwarfs` do?
+
+```
+$ time mkdwarfs -i winesrc -o winesrc.dwarfs -l9
+[...]
+I 07:55:20.546636 compressed 64.85 GiB to 93.2 MiB (ratio=0.00140344)
+I 07:55:20.826699 compression CPU time: 6.726m
+I 07:55:20.827338 filesystem created without errors [2.283m]
+[...]
+
+real    2m17.100s
+user    9m53.633s
+sys     2m29.236s
+```
+
+It uses pretty much the same amount of CPU resources, but finishes more than
+8 times faster. The DwarFS output file is more than 6 times smaller.
+
+You can actually squeeze a bit more redundancy out of the original data by
+tweaking the similarity ordering and switching from lzma to brotli compression,
+albeit at a somewhat slower compression speed:
+
+```
+mkdwarfs -i winesrc -o winesrc.dwarfs -l9 -C brotli:quality=11:lgwin=26 --order=nilsimsa:max-cluster-size=200k
+[...]
+I 08:21:01.138075 compressed 64.85 GiB to 73.52 MiB (ratio=0.00110716)
+I 08:21:01.485737 compression CPU time: 36.58m
+I 08:21:01.486313 filesystem created without errors [5.501m]
+[...]
+real    5m30.178s
+user    40m59.193s
+sys     2m36.234s
+```
+
+That's almost a 1000x reduction in size.
+
+Let's also look at decompression speed:
+
+```
+$ time zpaqfranz x winesrc.zpaq
+zpaqfranz v58.8k-JIT-L(2023-08-05)
+/home/mhx/winesrc.zpaq:
+1 versions, 3.480.317 files, 617.600.892 bytes (588.99 MB)
+Extract 69.632.090.852 bytes (64.85 GB) in 3.117.413 files (362.904 folders) / 16 T
+        99.18% 00:00:00  (  64.32 GB)=>(  64.85 GB)  548.83 MB/sec
+
+125.636 seconds (000:02:05) (all OK)
+
+real    2m6.968s
+user    1m36.177s
+sys     1m10.980s
+```
+
+```
+$ time dwarfsextract -i winesrc.dwarfs
+
+real    1m49.182s
+user    0m34.667s
+sys     1m28.733s
+```
+
+Decompression time is pretty much in the same ballpark, with just slightly
+shorter times for the DwarFS image.
 
 ### With wimlib
 
@@ -1997,3 +2172,30 @@ system calls.
 
 The FUSE driver also exposes the performance monitor metrics via
 an [extended attribute](#extended-attributes).
+
+
+## Other Obscure Features
+
+### Setting Worker Thread CPU Affinity
+
+This only works on Linux and usually only makes sense if you have CPUs
+with different types of cores (e.g. "performance" vs "efficiency" cores)
+and are *really* trying to squeeze the last ounce of speed out of DwarFS.
+
+By setting the environment variable `DWARFS_WORKER_GROUP_AFFINITY`, you
+can set the CPU affinity of different worker thread groups, e.g.:
+
+```
+export DWARFS_WORKER_GROUP_AFFINITY=blockify=3:compress=6,7
+```
+
+This will set the affinity of the `blockify` worker group to CPU 3 and
+the affinity of the `compress` worker group to CPUs 6 and 7.
+
+You can use this feature for all tools that use one or more worker thread
+groups. For example, the FUSE driver `dwarfs` and `dwarfsextract` use a
+worker group `blkcache` that the block cache (i.e. block decompression and
+lookup) runs on. `mkdwarfs` uses a whole array of different worker groups,
+namely `compress` for compression, `scanner` for scanning, `ordering` for
+input ordering, and `blockify` for segmenting. `blockify` is what you would
+typically want to run on your "performance" cores.

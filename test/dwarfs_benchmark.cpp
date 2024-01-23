@@ -26,7 +26,6 @@
 #include <thrift/lib/cpp2/frozen/FrozenUtil.h>
 
 #include "dwarfs/block_compressor.h"
-#include "dwarfs/block_manager.h"
 #include "dwarfs/entry.h"
 #include "dwarfs/file_stat.h"
 #include "dwarfs/filesystem_v2.h"
@@ -36,11 +35,13 @@
 #include "dwarfs/options.h"
 #include "dwarfs/progress.h"
 #include "dwarfs/scanner.h"
+#include "dwarfs/segmenter_factory.h"
 #include "dwarfs/string_table.h"
 #include "dwarfs/vfs_stat.h"
 #include "dwarfs/worker_group.h"
 #include "mmap_mock.h"
 #include "test_helpers.h"
+#include "test_logger.h"
 #include "test_strings.h"
 
 #include "dwarfs/gen-cpp2/metadata_layouts.h"
@@ -91,16 +92,17 @@ void PackParamsDirs(::benchmark::internal::Benchmark* b) {
 }
 
 std::string make_filesystem(::benchmark::State const& state) {
-  block_manager::config cfg;
+  segmenter_factory::config cfg;
   scanner_options options;
 
-  cfg.blockhash_window_size = 8;
+  cfg.blockhash_window_size.set_default(12);
+  cfg.window_increment_shift.set_default(1);
+  cfg.max_active_blocks.set_default(1);
+  cfg.bloom_filter_size.set_default(4);
   cfg.block_size_bits = 12;
 
   options.with_devices = true;
   options.with_specials = true;
-  options.inode.with_similarity = false;
-  options.inode.with_nilsimsa = false;
   options.keep_all_times = false;
   options.pack_chunk_table = true;
   options.pack_directories = state.range(0);
@@ -113,21 +115,22 @@ std::string make_filesystem(::benchmark::State const& state) {
   options.plain_names_table = state.range(1);
   options.plain_symlinks_table = state.range(1);
 
-  worker_group wg("writer", 4);
+  test::test_logger lgr;
+  auto os = test::os_access_mock::create_test_instance();
 
-  std::ostringstream logss;
-  stream_logger lgr(logss); // TODO: mock
-  lgr.set_policy<prod_logger_policy>();
+  worker_group wg(lgr, *os, "writer", 4);
+  progress prog([](const progress&, bool) {}, 1000);
 
-  scanner s(lgr, wg, cfg, entry_factory::create(),
-            test::os_access_mock::create_test_instance(),
+  auto sf = std::make_shared<segmenter_factory>(lgr, prog, cfg);
+
+  scanner s(lgr, wg, sf, entry_factory::create(), os,
             std::make_shared<test::script_mock>(), options);
 
   std::ostringstream oss;
-  progress prog([](const progress&, bool) {}, 1000);
 
   block_compressor bc("null");
-  filesystem_writer fsw(oss, lgr, wg, prog, bc);
+  filesystem_writer fsw(oss, lgr, wg, prog, bc, bc, bc);
+  fsw.add_default_compressor(bc);
 
   s.scan(fsw, "", prog);
 
@@ -166,7 +169,7 @@ void frozen_string_table_lookup(::benchmark::State& state) {
   auto data = make_frozen_string_table(
       test::test_strings,
       string_table::pack_options(state.range(0), state.range(1), true));
-  stream_logger lgr;
+  test::test_logger lgr;
   string_table table(lgr, "bench", data);
   int i = 0;
   std::string str;
@@ -178,14 +181,15 @@ void frozen_string_table_lookup(::benchmark::State& state) {
 
 void dwarfs_initialize(::benchmark::State& state) {
   auto image = make_filesystem(state);
-  stream_logger lgr;
+  test::test_logger lgr;
+  test::os_access_mock os;
   auto mm = std::make_shared<test::mmap_mock>(image);
   filesystem_options opts;
   opts.block_cache.max_bytes = 1 << 20;
   opts.metadata.enable_nlink = true;
 
   for (auto _ : state) {
-    auto fs = filesystem_v2(lgr, mm, opts);
+    auto fs = filesystem_v2(lgr, os, mm, opts);
     ::benchmark::DoNotOptimize(fs);
   }
 }
@@ -200,7 +204,7 @@ class filesystem : public ::benchmark::Fixture {
     filesystem_options opts;
     opts.block_cache.max_bytes = 1 << 20;
     opts.metadata.enable_nlink = true;
-    fs = std::make_unique<filesystem_v2>(lgr, mm, opts);
+    fs = std::make_unique<filesystem_v2>(lgr, os, mm, opts);
     entries.reserve(NUM_ENTRIES);
     for (int i = 0; entries.size() < NUM_ENTRIES; ++i) {
       if (auto e = fs->find(i)) {
@@ -279,7 +283,8 @@ class filesystem : public ::benchmark::Fixture {
   std::vector<inode_view> entries;
 
  private:
-  stream_logger lgr;
+  test::test_logger lgr;
+  test::os_access_mock os;
   std::string image;
   std::shared_ptr<mmif> mm;
 };

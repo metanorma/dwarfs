@@ -30,12 +30,22 @@
   DWARFS_COMPRESSION_TYPE(ZSTD,   2) SEPARATOR                           \
   DWARFS_COMPRESSION_TYPE(LZ4,    3) SEPARATOR                           \
   DWARFS_COMPRESSION_TYPE(LZ4HC,  4) SEPARATOR                           \
-  DWARFS_COMPRESSION_TYPE(BROTLI, 5)
+  DWARFS_COMPRESSION_TYPE(BROTLI, 5) SEPARATOR                           \
+  DWARFS_COMPRESSION_TYPE(FLAC,   6)
 // clang-format on
 
 namespace dwarfs {
 
-enum class compression_type : uint8_t {
+enum class compression_type_v1 : uint8_t {
+#define DWARFS_COMPRESSION_TYPE_ENUMERATION_(name, value) name = value
+#define DWARFS_COMMA_ ,
+  DWARFS_COMPRESSION_TYPE_LIST(DWARFS_COMPRESSION_TYPE_ENUMERATION_,
+                               DWARFS_COMMA_)
+#undef DWARFS_COMPRESSION_TYPE_ENUMERATION_
+#undef DWARFS_COMMA_
+};
+
+enum class compression_type : uint16_t {
 #define DWARFS_COMPRESSION_TYPE_ENUMERATION_(name, value) name = value
 #define DWARFS_COMMA_ ,
   DWARFS_COMPRESSION_TYPE_LIST(DWARFS_COMPRESSION_TYPE_ENUMERATION_,

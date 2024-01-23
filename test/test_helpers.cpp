@@ -24,20 +24,23 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <random>
+#include <regex>
 
 #include <fmt/format.h>
 
+#include <folly/FileUtil.h>
 #include <folly/String.h>
 #include <folly/portability/Unistd.h>
 
+#include "dwarfs/os_access_generic.h"
 #include "dwarfs/overloaded.h"
 #include "dwarfs/util.h"
 #include "loremipsum.h"
 #include "mmap_mock.h"
 #include "test_helpers.h"
 
-namespace dwarfs {
-namespace test {
+namespace dwarfs::test {
 
 namespace fs = std::filesystem;
 
@@ -158,7 +161,9 @@ class dir_reader_mock : public dir_reader {
   size_t index_;
 };
 
-os_access_mock::os_access_mock() = default;
+os_access_mock::os_access_mock()
+    : real_os_{std::make_shared<os_access_generic>()} {}
+
 os_access_mock::~os_access_mock() = default;
 
 std::shared_ptr<os_access_mock> os_access_mock::create_test_instance() {
@@ -258,7 +263,7 @@ void os_access_mock::add_dir(fs::path const& path) {
   add(path, st);
 }
 
-void os_access_mock::add_file(fs::path const& path, size_t size) {
+void os_access_mock::add_file(fs::path const& path, size_t size, bool random) {
   simplestat st;
   std::memset(&st, 0, sizeof(st));
   st.ino = ino_++;
@@ -266,6 +271,23 @@ void os_access_mock::add_file(fs::path const& path, size_t size) {
   st.uid = 1000;
   st.gid = 100;
   st.size = size;
+
+  if (random) {
+    thread_local std::mt19937_64 rng{42};
+
+    std::uniform_int_distribution<> choice_dist{0, 3};
+
+    switch (choice_dist(rng)) {
+    default:
+      break;
+
+    case 0:
+      add(path, st,
+          [size, seed = rng()] { return create_random_string(size, seed); });
+      return;
+    }
+  }
+
   add(path, st, [size] { return loremipsum(size); });
 }
 
@@ -281,8 +303,40 @@ void os_access_mock::add_file(fs::path const& path,
   add(path, st, contents);
 }
 
+void os_access_mock::add_local_files(fs::path const& base_path) {
+  for (auto const& p : fs::recursive_directory_iterator(base_path)) {
+    if (p.is_directory()) {
+      add_dir(fs::relative(p.path(), base_path));
+    } else if (p.is_regular_file()) {
+      auto relpath = fs::relative(p.path(), base_path);
+      simplestat st;
+      std::memset(&st, 0, sizeof(st));
+      st.ino = ino_++;
+      st.mode = posix_file_type::regular | 0644;
+      st.uid = 1000;
+      st.gid = 100;
+      st.size = p.file_size();
+      add(relpath, st, [path = p.path().string()] {
+        std::string rv;
+        if (!folly::readFile(path.c_str(), rv)) {
+          throw std::runtime_error(fmt::format("failed to read file {}", path));
+        }
+        return rv;
+      });
+    }
+  }
+}
+
 void os_access_mock::set_access_fail(fs::path const& path) {
   access_fail_set_.emplace(path);
+}
+
+void os_access_mock::set_map_file_error(std::filesystem::path const& path,
+                                        std::exception_ptr ep,
+                                        int after_n_attempts) {
+  auto& e = map_file_errors_[path];
+  e.ep = std::move(ep);
+  e.remaining_successful_attempts = after_n_attempts;
 }
 
 size_t os_access_mock::size() const { return root_ ? root_->size() : 0; }
@@ -292,7 +346,8 @@ std::vector<std::string> os_access_mock::splitpath(fs::path const& path) {
   for (auto const& p : path) {
     parts.emplace_back(u8string_to_string(p.u8string()));
   }
-  while (!parts.empty() && (parts.front().empty() || parts.front() == "/")) {
+  while (!parts.empty() && (parts.front().empty() ||
+                            (parts.front() == "/" || parts.front() == "\\"))) {
     parts.erase(parts.begin());
   }
   return parts;
@@ -344,7 +399,7 @@ void os_access_mock::add_internal(fs::path const& path, simplestat const& st,
   }
 }
 
-std::shared_ptr<dir_reader>
+std::unique_ptr<dir_reader>
 os_access_mock::opendir(fs::path const& path) const {
   if (auto de = find(path);
       de && de->status.type() == posix_file_type::directory) {
@@ -353,7 +408,7 @@ os_access_mock::opendir(fs::path const& path) const {
          std::get<std::unique_ptr<mock_directory>>(de->v)->ent) {
       files.push_back(path / e.name);
     }
-    return std::make_shared<dir_reader_mock>(std::move(files));
+    return std::make_unique<dir_reader_mock>(std::move(files));
   }
 
   throw std::runtime_error(fmt::format("oops in opendir: {}", path.string()));
@@ -378,46 +433,142 @@ fs::path os_access_mock::read_symlink(fs::path const& path) const {
       fmt::format("oops in read_symlink: {}", path.string()));
 }
 
-std::shared_ptr<mmif>
+std::unique_ptr<mmif>
 os_access_mock::map_file(fs::path const& path, size_t size) const {
   if (auto de = find(path);
       de && de->status.type() == posix_file_type::regular) {
-    return std::make_shared<mmap_mock>(std::visit(
-        overloaded{
-            [this](std::string const& str) { return str; },
-            [this](std::function<std::string()> const& fun) { return fun(); },
-            [this](auto const&) -> std::string {
-              throw std::runtime_error("oops in overloaded");
-            },
-        },
-        de->v));
+    if (auto it = map_file_errors_.find(path); it != map_file_errors_.end()) {
+      int remaining = it->second.remaining_successful_attempts.load();
+      while (!it->second.remaining_successful_attempts.compare_exchange_weak(
+          remaining, remaining - 1)) {
+      }
+      if (remaining <= 0) {
+        std::rethrow_exception(it->second.ep);
+      }
+    }
+
+    return std::make_unique<mmap_mock>(
+        std::visit(overloaded{
+                       [this](std::string const& str) { return str; },
+                       [this](std::function<std::string()> const& fun) {
+                         return fun();
+                       },
+                       [this](auto const&) -> std::string {
+                         throw std::runtime_error("oops in overloaded");
+                       },
+                   },
+                   de->v),
+        size);
   }
 
   throw std::runtime_error(fmt::format("oops in map_file: {}", path.string()));
+}
+
+std::set<std::filesystem::path> os_access_mock::get_failed_paths() const {
+  std::set<std::filesystem::path> rv = access_fail_set_;
+  for (auto const& [path, error] : map_file_errors_) {
+    if (error.remaining_successful_attempts.load() < 0) {
+      rv.emplace(path);
+    }
+  }
+  return rv;
+}
+
+std::unique_ptr<mmif> os_access_mock::map_file(fs::path const& path) const {
+  return map_file(path, std::numeric_limits<size_t>::max());
 }
 
 int os_access_mock::access(fs::path const& path, int) const {
   return access_fail_set_.count(path) ? -1 : 0;
 }
 
-std::optional<fs::path> find_binary(std::string_view name) {
-  auto path_str = std::getenv("PATH");
-  if (!path_str) {
-    return std::nullopt;
+std::filesystem::path
+os_access_mock::canonical(std::filesystem::path const& path) const {
+  return path;
+}
+
+std::filesystem::path os_access_mock::current_path() const {
+  return root_->name;
+}
+
+void os_access_mock::setenv(std::string name, std::string value) {
+  env_[std::move(name)] = std::move(value);
+}
+
+std::optional<std::string> os_access_mock::getenv(std::string_view name) const {
+  if (auto it = env_.find(std::string(name)); it != env_.end()) {
+    return it->second;
+  }
+  return std::nullopt;
+}
+
+void os_access_mock::thread_set_affinity(std::thread::id tid,
+                                         std::span<int const> cpus,
+                                         std::error_code& /*ec*/) const {
+  std::lock_guard<std::mutex> lock{mx_};
+  set_affinity_calls.emplace_back(tid,
+                                  std::vector<int>(cpus.begin(), cpus.end()));
+}
+
+std::chrono::nanoseconds
+os_access_mock::thread_get_cpu_time(std::thread::id tid,
+                                    std::error_code& ec) const {
+  return real_os_->thread_get_cpu_time(tid, ec);
+}
+
+std::filesystem::path
+os_access_mock::find_executable(std::filesystem::path const& name) const {
+  if (executable_resolver_) {
+    return executable_resolver_(name);
   }
 
-  std::vector<std::string> path;
-  folly::split(':', path_str, path);
+  return real_os_->find_executable(name);
+}
 
-  for (auto dir : path) {
-    auto cand = fs::path(dir) / name;
-    if (fs::exists(cand) and ::access(cand.string().c_str(), X_OK) == 0) {
-      return cand;
-    }
+void os_access_mock::set_executable_resolver(
+    executable_resolver_type resolver) {
+  executable_resolver_ = std::move(resolver);
+}
+
+std::optional<fs::path> find_binary(std::string_view name) {
+  os_access_generic os;
+
+  if (auto path = os.find_executable(name); !path.empty()) {
+    return path;
   }
 
   return std::nullopt;
 }
 
-} // namespace test
-} // namespace dwarfs
+std::vector<std::string> parse_args(std::string_view args) {
+  std::vector<std::string> rv;
+  folly::split(' ', args, rv);
+  return rv;
+}
+
+std::string create_random_string(size_t size, uint8_t min, uint8_t max,
+                                 std::mt19937_64& gen) {
+  std::string rv;
+  rv.resize(size);
+  std::uniform_int_distribution<> byte_dist{min, max};
+  std::generate(rv.begin(), rv.end(), [&] { return byte_dist(gen); });
+  return rv;
+}
+
+std::string create_random_string(size_t size, std::mt19937_64& gen) {
+  return create_random_string(size, 0, 255, gen);
+}
+
+std::string create_random_string(size_t size, size_t seed) {
+  std::mt19937_64 tmprng{seed};
+  return create_random_string(size, tmprng);
+}
+
+std::string fix_regex(std::string regex) {
+#ifndef _WIN32
+  regex = std::regex_replace(regex, std::regex("\\\\d"), "[0-9]");
+#endif
+  return regex;
+}
+
+} // namespace dwarfs::test

@@ -63,13 +63,23 @@ class lzma_block_compressor final : public block_compressor::impl {
     return std::make_unique<lzma_block_compressor>(*this);
   }
 
-  std::vector<uint8_t>
-  compress(const std::vector<uint8_t>& data) const override;
-  std::vector<uint8_t> compress(std::vector<uint8_t>&& data) const override {
-    return compress(data);
+  std::vector<uint8_t> compress(const std::vector<uint8_t>& data,
+                                std::string const* metadata) const override;
+  std::vector<uint8_t> compress(std::vector<uint8_t>&& data,
+                                std::string const* metadata) const override {
+    return compress(data, metadata);
   }
 
   compression_type type() const override { return compression_type::LZMA; }
+
+  std::string describe() const override { return description_; }
+
+  std::string metadata_requirements() const override { return std::string(); }
+
+  compression_constraints
+  get_compression_constraints(std::string const&) const override {
+    return compression_constraints();
+  }
 
  private:
   std::vector<uint8_t>
@@ -107,11 +117,16 @@ class lzma_block_compressor final : public block_compressor::impl {
 
   lzma_options_lzma opt_lzma_;
   std::array<lzma_filter, 3> filters_;
+  std::string description_;
 };
 
 lzma_block_compressor::lzma_block_compressor(unsigned level, bool extreme,
                                              const std::string& binary_mode,
-                                             unsigned dict_size) {
+                                             unsigned dict_size)
+    : description_{
+          fmt::format("lzma [level={}, dict_size={}{}{}]", level, dict_size,
+                      extreme ? ", extreme" : "",
+                      binary_mode.empty() ? "" : ", binary=" + binary_mode)} {
   if (lzma_lzma_preset(&opt_lzma_, get_preset(level, extreme))) {
     DWARFS_THROW(runtime_error, "unsupported preset, possibly a bug");
   }
@@ -167,7 +182,8 @@ lzma_block_compressor::compress(const std::vector<uint8_t>& data,
 }
 
 std::vector<uint8_t>
-lzma_block_compressor::compress(const std::vector<uint8_t>& data) const {
+lzma_block_compressor::compress(const std::vector<uint8_t>& data,
+                                std::string const* /*metadata*/) const {
   std::vector<uint8_t> best = compress(data, &filters_[1]);
 
   if (filters_[0].id != LZMA_VLI_UNKNOWN) {
@@ -207,6 +223,8 @@ class lzma_block_decompressor final : public block_decompressor::impl {
   ~lzma_block_decompressor() override { lzma_end(&stream_); }
 
   compression_type type() const override { return compression_type::LZMA; }
+
+  std::optional<std::string> metadata() const override { return std::nullopt; }
 
   bool decompress_frame(size_t frame_size) override {
     if (!error_.empty()) {
@@ -321,7 +339,11 @@ class lzma_compression_factory : public compression_factory {
  public:
   std::string_view name() const override { return "lzma"; }
 
-  std::string_view description() const override { return "LZMA compression"; }
+  std::string_view description() const override {
+    static std::string const s_desc{
+        fmt::format("LZMA compression (liblzma {})", ::lzma_version_string())};
+    return s_desc;
+  }
 
   std::vector<std::string> const& options() const override { return options_; }
 

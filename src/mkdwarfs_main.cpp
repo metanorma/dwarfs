@@ -25,7 +25,6 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -37,7 +36,12 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include <boost/algorithm/string.hpp>
 #include <boost/program_options.hpp>
@@ -51,23 +55,33 @@
 #include <fmt/format.h>
 
 #include "dwarfs/block_compressor.h"
-#include "dwarfs/block_manager.h"
+#include "dwarfs/block_compressor_parser.h"
 #include "dwarfs/builtin_script.h"
-#include "dwarfs/chmod_transformer.h"
+#include "dwarfs/categorizer.h"
+#include "dwarfs/category_parser.h"
+#include "dwarfs/chmod_entry_transformer.h"
 #include "dwarfs/console_writer.h"
 #include "dwarfs/entry.h"
 #include "dwarfs/error.h"
+#include "dwarfs/file_access.h"
+#include "dwarfs/filesystem_block_category_resolver.h"
 #include "dwarfs/filesystem_v2.h"
 #include "dwarfs/filesystem_writer.h"
+#include "dwarfs/filter_debug.h"
+#include "dwarfs/fragment_order_parser.h"
+#include "dwarfs/integral_value_parser.h"
+#include "dwarfs/iolayer.h"
 #include "dwarfs/logger.h"
 #include "dwarfs/mmap.h"
 #include "dwarfs/options.h"
 #include "dwarfs/options_interface.h"
-#include "dwarfs/os_access_generic.h"
+#include "dwarfs/os_access.h"
+#include "dwarfs/overloaded.h"
 #include "dwarfs/program_options_helpers.h"
 #include "dwarfs/progress.h"
 #include "dwarfs/scanner.h"
 #include "dwarfs/script.h"
+#include "dwarfs/segmenter_factory.h"
 #include "dwarfs/terminal.h"
 #include "dwarfs/tool.h"
 #include "dwarfs/util.h"
@@ -79,39 +93,14 @@ namespace dwarfs {
 
 namespace {
 
-enum class debug_filter_mode {
-  OFF,
-  INCLUDED,
-  INCLUDED_FILES,
-  EXCLUDED,
-  EXCLUDED_FILES,
-  FILES,
-  ALL
-};
-
-const std::map<std::string, file_order_mode> order_choices{
-    {"none", file_order_mode::NONE},
-    {"path", file_order_mode::PATH},
-    {"similarity", file_order_mode::SIMILARITY},
-    {"nilsimsa", file_order_mode::NILSIMSA},
-};
-
 const std::map<std::string, console_writer::progress_mode> progress_modes{
     {"none", console_writer::NONE},
     {"simple", console_writer::SIMPLE},
     {"ascii", console_writer::ASCII},
-#ifndef _WIN32
     {"unicode", console_writer::UNICODE},
-#endif
 };
 
-const std::string default_progress_mode =
-#ifdef _WIN32
-    "ascii"
-#else
-    "unicode"
-#endif
-    ;
+const std::string default_progress_mode = "unicode";
 
 const std::map<std::string, debug_filter_mode> debug_filter_modes{
     {"included", debug_filter_mode::INCLUDED},
@@ -132,69 +121,10 @@ const std::map<std::string, uint32_t> time_resolutions{
 constexpr size_t min_block_size_bits{10};
 constexpr size_t max_block_size_bits{30};
 
-void debug_filter_output(std::ostream& os, bool exclude, entry const* pe,
-                         debug_filter_mode mode) {
-  if (exclude ? mode == debug_filter_mode::INCLUDED or
-                    mode == debug_filter_mode::INCLUDED_FILES
-              : mode == debug_filter_mode::EXCLUDED or
-                    mode == debug_filter_mode::EXCLUDED_FILES) {
-    return;
-  }
-
-  bool const files_only = mode == debug_filter_mode::FILES or
-                          mode == debug_filter_mode::INCLUDED_FILES or
-                          mode == debug_filter_mode::EXCLUDED_FILES;
-
-  if (files_only and pe->type() == entry::E_DIR) {
-    return;
-  }
-
-  char const* prefix = "";
-
-  if (mode == debug_filter_mode::FILES or mode == debug_filter_mode::ALL) {
-    prefix = exclude ? "- " : "+ ";
-  }
-
-  os << prefix << pe->unix_dpath() << "\n";
-}
-
-int parse_order_option(std::string const& ordname, std::string const& opt,
-                       int& value, std::string_view name,
-                       std::optional<int> min = std::nullopt,
-                       std::optional<int> max = std::nullopt) {
-  if (!opt.empty()) {
-    if (auto val = folly::tryTo<int>(opt)) {
-      auto tmp = *val;
-      if (min && max && (tmp < *min || tmp > *max)) {
-        std::cerr << "error: " << name << " (" << opt
-                  << ") out of range for order '" << ordname << "' (" << *min
-                  << ".." << *max << ")\n";
-        return 1;
-      }
-      if (min && tmp < *min) {
-        std::cerr << "error: " << name << " (" << opt
-                  << ") cannot be less than " << *min << " for order '"
-                  << ordname << "'\n";
-      }
-      if (max && tmp > *max) {
-        std::cerr << "error: " << name << " (" << opt
-                  << ") cannot be greater than " << *max << " for order '"
-                  << ordname << "'\n";
-      }
-      value = tmp;
-    } else {
-      std::cerr << "error: " << name << " (" << opt
-                << ") is not numeric for order '" << ordname << "'\n";
-      return 1;
-    }
-  }
-  return 0;
-}
-
 struct level_defaults {
   unsigned block_size_bits;
   std::string_view data_compression;
-  std::string_view schema_compression;
+  std::string_view schema_history_compression;
   std::string_view metadata_compression;
   unsigned window_size;
   unsigned window_step;
@@ -256,7 +186,7 @@ struct level_defaults {
 #endif
 
 #if defined(DWARFS_HAVE_LIBZSTD)
-#define ALG_SCHEMA "zstd:level=12"
+#define ALG_SCHEMA "zstd:level=16"
 #elif defined(DWARFS_HAVE_LIBLZMA)
 #define ALG_SCHEMA "lzma:level=4"
 #elif defined(DWARFS_HAVE_LIBLZ4)
@@ -300,33 +230,155 @@ constexpr std::array<level_defaults, 10> levels{{
     // clang-format on
 }};
 
+const std::unordered_map<std::string, std::vector<std::string>>
+    categorize_defaults_common{
+        // clang-format off
+        {"--compression", {"incompressible::null"}},
+        // clang-format on
+    };
+
+const std::unordered_map<std::string, std::vector<std::string>>
+    categorize_defaults_fast{
+        // clang-format off
+        {"--order",       {"pcmaudio/waveform::revpath"}},
+        {"--window-size", {"pcmaudio/waveform::0"}},
+#ifdef DWARFS_HAVE_FLAC
+        {"--compression", {"pcmaudio/waveform::flac:level=3"}},
+#else
+        {"--compression", {"pcmaudio/waveform::zstd:level=3"}},
+#endif
+        // clang-format on
+    };
+
+const std::unordered_map<std::string, std::vector<std::string>>
+    categorize_defaults_medium{
+        // clang-format off
+        {"--order",       {"pcmaudio/waveform::revpath"}},
+        {"--window-size", {"pcmaudio/waveform::20"}},
+#ifdef DWARFS_HAVE_FLAC
+        {"--compression", {"pcmaudio/waveform::flac:level=5"}},
+#else
+        {"--compression", {"pcmaudio/waveform::zstd:level=5"}},
+#endif
+        // clang-format on
+    };
+
+const std::unordered_map<std::string, std::vector<std::string>>
+    categorize_defaults_slow{
+        // clang-format off
+        {"--window-size", {"pcmaudio/waveform::16"}},
+#ifdef DWARFS_HAVE_FLAC
+        {"--compression", {"pcmaudio/waveform::flac:level=8"}},
+#else
+        {"--compression", {"pcmaudio/waveform::zstd:level=8"}},
+#endif
+        // clang-format on
+    };
+
+constexpr std::array<
+    std::unordered_map<std::string, std::vector<std::string>> const*, 10>
+    categorize_defaults_level{{
+        // clang-format off
+        /* 0 */ &categorize_defaults_fast,
+        /* 1 */ &categorize_defaults_fast,
+        /* 2 */ &categorize_defaults_fast,
+        /* 3 */ &categorize_defaults_fast,
+        /* 4 */ &categorize_defaults_fast,
+        /* 5 */ &categorize_defaults_medium,
+        /* 6 */ &categorize_defaults_medium,
+        /* 7 */ &categorize_defaults_medium,
+        /* 8 */ &categorize_defaults_slow,
+        /* 9 */ &categorize_defaults_slow,
+        // clang-format on
+    }};
+
 constexpr unsigned default_level = 7;
+
+class categorize_optval {
+ public:
+  std::string value;
+  bool is_explicit{false};
+
+  categorize_optval() = default;
+  explicit categorize_optval(std::string const& val, bool expl = false)
+      : value{val}
+      , is_explicit{expl} {}
+
+  bool is_implicit_default() const { return !value.empty() && !is_explicit; }
+
+  template <typename T>
+  void add_implicit_defaults(T& cop) const {
+    if (is_implicit_default()) {
+      if (auto it = defaults_.find(cop.name()); it != defaults_.end()) {
+        for (auto const& value : it->second) {
+          cop.parse_fallback(value);
+        }
+      }
+    }
+  }
+
+  void
+  add_defaults(std::unordered_map<std::string, std::vector<std::string>> const&
+                   defaults) {
+    for (auto const& [key, values] : defaults) {
+      auto& vs = defaults_[key];
+      vs.insert(vs.end(), values.begin(), values.end());
+    }
+  }
+
+ private:
+  std::unordered_map<std::string, std::vector<std::string>> defaults_;
+};
+
+std::ostream& operator<<(std::ostream& os, categorize_optval const& optval) {
+  return os << optval.value << (optval.is_explicit ? " (explicit)" : "");
+}
+
+void validate(boost::any& v, std::vector<std::string> const& values,
+              categorize_optval*, int) {
+  po::validators::check_first_occurrence(v);
+  v = categorize_optval{po::validators::get_single_string(values), true};
+}
 
 } // namespace
 
-int mkdwarfs_main(int argc, sys_char** argv) {
+int mkdwarfs_main(int argc, sys_char** argv, iolayer const& iol) {
   using namespace folly::gen;
 
   const size_t num_cpu = std::max(folly::hardware_concurrency(), 1u);
+  constexpr size_t const kDefaultMaxActiveBlocks{1};
+  constexpr size_t const kDefaultBloomFilterSize{4};
 
-  block_manager::config cfg;
-  sys_string path_str, output_str;
-  std::string memory_limit, script_arg, compression, header, schema_compression,
-      metadata_compression, log_level_str, timestamp, time_resolution, order,
-      progress_mode, recompress_opts, pack_metadata, file_hash_algo,
-      debug_filter, max_similarity_size, input_list_str, chmod_str;
+  segmenter_factory::config sf_config;
+  sys_string path_str, input_list_str, output_str, header_str;
+  std::string memory_limit, script_arg, schema_compression,
+      metadata_compression, timestamp, time_resolution, progress_mode,
+      recompress_opts, pack_metadata, file_hash_algo, debug_filter,
+      max_similarity_size, chmod_str, history_compression,
+      recompress_categories;
   std::vector<sys_string> filter;
-  size_t num_workers, num_scanner_workers;
+  std::vector<std::string> order, max_lookback_blocks, window_size, window_step,
+      bloom_filter_size, compression;
+  size_t num_workers, num_scanner_workers, num_segmenter_workers;
   bool no_progress = false, remove_header = false, no_section_index = false,
-       force_overwrite = false;
+       force_overwrite = false, no_history = false,
+       no_history_timestamps = false, no_history_command_line = false;
   unsigned level;
   int compress_niceness;
   uint16_t uid, gid;
+  categorize_optval categorizer_list;
+
+  integral_value_parser<size_t> max_lookback_parser;
+  integral_value_parser<unsigned> window_size_parser(0, 24);
+  integral_value_parser<unsigned> window_step_parser(0, 8);
+  integral_value_parser<unsigned> bloom_filter_size_parser(0, 10);
+  fragment_order_parser order_parser;
+  block_compressor_parser compressor_parser;
 
   scanner_options options;
+  logger_options logopts;
 
-  auto order_desc =
-      "inode order (" + (from(order_choices) | get<0>() | unsplit(", ")) + ")";
+  auto order_desc = "inode fragments order (" + order_parser.choices() + ")";
 
   auto progress_desc = "progress mode (" +
                        (from(progress_modes) | get<0>() | unsplit(", ")) + ")";
@@ -344,6 +396,26 @@ int mkdwarfs_main(int argc, sys_char** argv) {
   auto file_hash_desc = "choice of file hashing function (none, " +
                         (from(hash_list) | unsplit(", ")) + ")";
 
+  auto& catreg = categorizer_registry::instance();
+
+  auto categorize_desc = "enable categorizers in the given order (" +
+                         (from(catreg.categorizer_names()) | unsplit(", ")) +
+                         ")";
+
+  auto lvl_def_val = [](auto opt) {
+    return fmt::format("arg (={})", levels[default_level].*opt);
+  };
+
+  auto dep_def_val = [](auto dep) { return fmt::format("arg (={})", dep); };
+
+  auto cat_def_val = [](auto def) {
+    return fmt::format("[cat::]arg (={})", def);
+  };
+
+  auto lvl_cat_def_val = [](auto opt) {
+    return fmt::format("[cat::]arg (={})", levels[default_level].*opt);
+  };
+
   // clang-format off
   po::options_description basic_opts("Options");
   basic_opts.add_options()
@@ -351,22 +423,21 @@ int mkdwarfs_main(int argc, sys_char** argv) {
         po_sys_value<sys_string>(&path_str),
         "path to root directory or source filesystem")
     ("input-list",
-        po::value<std::string>(&input_list_str),
-        "file containing list of paths relative to root directory")
+        po_sys_value<sys_string>(&input_list_str),
+        "file containing list of file paths relative to root directory "
+        "or - for stdin")
     ("output,o",
         po_sys_value<sys_string>(&output_str),
-        "filesystem output name")
+        "filesystem output name or - for stdout")
     ("force,f",
         po::value<bool>(&force_overwrite)->zero_tokens(),
         "force overwrite of existing output image")
     ("compress-level,l",
         po::value<unsigned>(&level)->default_value(default_level),
         "compression level (0=fast, 9=best, please see man page for details)")
-    ("log-level",
-        po::value<std::string>(&log_level_str)->default_value("info"),
-        "log level (error, warn, info, debug, trace)")
-    ("help,h",
-        "output help message and exit")
+    ;
+  add_common_options(basic_opts, logopts);
+  basic_opts.add_options()
     ("long-help,H",
         "output full help message and exit")
     ;
@@ -374,7 +445,8 @@ int mkdwarfs_main(int argc, sys_char** argv) {
   po::options_description advanced_opts("Advanced options");
   advanced_opts.add_options()
     ("block-size-bits,S",
-        po::value<unsigned>(&cfg.block_size_bits),
+        po::value<unsigned>(&sf_config.block_size_bits)
+          ->value_name(lvl_def_val(&level_defaults::block_size_bits)),
         "block size bits (size = 2^arg bits)")
     ("num-workers,N",
         po::value<size_t>(&num_workers)->default_value(num_cpu),
@@ -383,16 +455,30 @@ int mkdwarfs_main(int argc, sys_char** argv) {
         po::value<int>(&compress_niceness)->default_value(5),
         "compression worker threads niceness")
     ("num-scanner-workers",
-        po::value<size_t>(&num_scanner_workers),
-        "number of scanner (hashing) worker threads")
+        po::value<size_t>(&num_scanner_workers)
+          ->value_name(dep_def_val("num-workers")),
+        "number of scanner (hasher/categorizer) worker threads")
+    ("num-segmenter-workers",
+        po::value<size_t>(&num_segmenter_workers)
+          ->value_name(dep_def_val("num-workers")),
+        "number of segmenter worker threads")
     ("memory-limit,L",
         po::value<std::string>(&memory_limit)->default_value("1g"),
         "block manager memory limit")
     ("recompress",
         po::value<std::string>(&recompress_opts)->implicit_value("all"),
         "recompress an existing filesystem (none, block, metadata, all)")
+    ("recompress-categories",
+        po::value<std::string>(&recompress_categories),
+        "only recompress blocks of these categories")
+    ("categorize",
+        po::value<categorize_optval>(&categorizer_list)
+          ->implicit_value(categorize_optval("pcmaudio,incompressible")),
+        categorize_desc.c_str())
     ("order",
-        po::value<std::string>(&order),
+        po::value<std::vector<std::string>>(&order)
+          ->value_name(lvl_cat_def_val(&level_defaults::order))
+          ->multitoken()->composing(),
         order_desc.c_str())
     ("max-similarity-size",
         po::value<std::string>(&max_similarity_size),
@@ -417,7 +503,7 @@ int mkdwarfs_main(int argc, sys_char** argv) {
         po::value<bool>(&options.with_specials)->zero_tokens(),
         "include named fifo and sockets")
     ("header",
-        po::value<std::string>(&header),
+        po_sys_value<sys_string>(&header_str),
         "prepend output filesystem with contents of this file")
     ("remove-header",
         po::value<bool>(&remove_header)->zero_tokens(),
@@ -426,41 +512,67 @@ int mkdwarfs_main(int argc, sys_char** argv) {
     ("no-section-index",
         po::value<bool>(&no_section_index)->zero_tokens(),
         "don't add section index to file system")
+    ("no-history",
+        po::value<bool>(&no_history)->zero_tokens(),
+        "don't add history to file system")
+    ("no-history-timestamps",
+        po::value<bool>(&no_history_timestamps)->zero_tokens(),
+        "don't add timestamps to file system history")
+    ("no-history-command-line",
+        po::value<bool>(&no_history_command_line)->zero_tokens(),
+        "don't add command line to file system history")
     ;
 
   po::options_description segmenter_opts("Segmenter options");
   segmenter_opts.add_options()
     ("max-lookback-blocks,B",
-        po::value<size_t>(&cfg.max_active_blocks)->default_value(1),
+        po::value<std::vector<std::string>>(&max_lookback_blocks)
+          ->value_name(cat_def_val(kDefaultMaxActiveBlocks))
+          ->multitoken()->composing(),
         "how many blocks to scan for segments")
     ("window-size,W",
-        po::value<unsigned>(&cfg.blockhash_window_size),
+        po::value<std::vector<std::string>>(&window_size)
+          ->value_name(lvl_cat_def_val(&level_defaults::window_size))
+          ->multitoken()->composing(),
         "window sizes for block hashing")
     ("window-step,w",
-        po::value<unsigned>(&cfg.window_increment_shift),
+        po::value<std::vector<std::string>>(&window_step)
+          ->value_name(lvl_cat_def_val(&level_defaults::window_step))
+          ->multitoken()->composing(),
         "window step (as right shift of size)")
     ("bloom-filter-size",
-        po::value<unsigned>(&cfg.bloom_filter_size)->default_value(4),
+        po::value<std::vector<std::string>>(&bloom_filter_size)
+          ->value_name(cat_def_val(kDefaultBloomFilterSize))
+          ->multitoken()->composing(),
         "bloom filter size (2^N*values bits)")
     ;
 
   po::options_description compressor_opts("Compressor options");
   compressor_opts.add_options()
     ("compression,C",
-        po::value<std::string>(&compression),
+        po::value<std::vector<std::string>>(&compression)
+          ->value_name(lvl_cat_def_val(&level_defaults::data_compression))
+          ->multitoken()->composing(),
         "block compression algorithm")
     ("schema-compression",
-        po::value<std::string>(&schema_compression),
+        po::value<std::string>(&schema_compression)
+          ->value_name(lvl_def_val(&level_defaults::schema_history_compression)),
         "metadata schema compression algorithm")
     ("metadata-compression",
-        po::value<std::string>(&metadata_compression),
+        po::value<std::string>(&metadata_compression)
+          ->value_name(lvl_def_val(&level_defaults::metadata_compression)),
         "metadata compression algorithm")
+    ("history-compression",
+        po::value<std::string>(&history_compression)
+          ->value_name(lvl_def_val(&level_defaults::schema_history_compression)),
+        "history compression algorithm")
     ;
 
   po::options_description filter_opts("Filter options");
   filter_opts.add_options()
     ("filter,F",
-        po_sys_value<std::vector<sys_string>>(&filter)->multitoken(),
+        po_sys_value<std::vector<sys_string>>(&filter)
+          ->multitoken()->composing(),
         "add filter rule")
     ("debug-filter",
         po::value<std::string>(&debug_filter)->implicit_value("all"),
@@ -510,9 +622,16 @@ int mkdwarfs_main(int argc, sys_char** argv) {
       .add(filesystem_opts)
       .add(metadata_opts);
 
+  catreg.add_options(opts);
+
   po::variables_map vm;
 
-  auto& sys_err_out = SYS_CERR;
+  std::vector<std::string> command_line;
+  command_line.reserve(argc);
+
+  for (int i = 0; i < argc; ++i) {
+    command_line.emplace_back(sys_string_to_string(argv[i]));
+  }
 
   try {
     auto parsed = po::parse_command_line(argc, argv, opts);
@@ -524,114 +643,126 @@ int mkdwarfs_main(int argc, sys_char** argv) {
         po::collect_unrecognized(parsed.options, po::include_positional);
 
     if (!unrecognized.empty()) {
-      sys_err_out << "error: unrecognized argument(s) '"
-                  << boost::join(unrecognized, " ") << "'\n";
+      iol.err << "error: unrecognized argument(s) '"
+              << sys_string_to_string(boost::join(unrecognized, " ")) << "'\n";
       return 1;
     }
   } catch (po::error const& e) {
-    std::cerr << "error: " << e.what() << "\n";
+    iol.err << "error: " << e.what() << "\n";
     return 1;
   }
 
-  auto const usage = "Usage: mkdwarfs [OPTIONS...]\n";
+#ifdef DWARFS_BUILTIN_MANPAGE
+  if (vm.count("man")) {
+    show_manpage(manpage::get_mkdwarfs_manpage(), iol);
+    return 0;
+  }
+#endif
+
+  auto constexpr usage = "Usage: mkdwarfs [OPTIONS...]\n";
 
   if (vm.count("long-help")) {
-    size_t l_dc = 0, l_sc = 0, l_mc = 0, l_or = 0;
+    std::string_view constexpr block_data_hdr{"Block Data"};
+    std::string_view constexpr schema_history_hdr{"Schema/History"};
+    std::string_view constexpr metadata_hdr{"Metadata"};
+    size_t l_dc{block_data_hdr.size()}, l_sc{schema_history_hdr.size()},
+        l_mc{metadata_hdr.size()}, l_or{0};
     for (auto const& l : levels) {
       l_dc = std::max(l_dc, l.data_compression.size());
-      l_sc = std::max(l_sc, l.schema_compression.size());
+      l_sc = std::max(l_sc, l.schema_history_compression.size());
       l_mc = std::max(l_mc, l.metadata_compression.size());
       l_or = std::max(l_or, l.order.size());
     }
 
     std::string sep(30 + l_dc + l_sc + l_mc + l_or, '-');
 
-    std::cout << tool_header("mkdwarfs") << usage << opts << "\n"
-              << "Compression level defaults:\n"
-              << "  " << sep << "\n"
-              << fmt::format("  Level  Block  {:{}s} {:s}     Inode\n",
-                             "Compression Algorithm", 4 + l_dc + l_sc + l_mc,
-                             "Window")
-              << fmt::format("         Size   {:{}s}  {:{}s}  {:{}s} {:6s}\n",
-                             "Block Data", l_dc, "Schema", l_sc, "Metadata",
-                             l_mc, "Size/Step  Order")
-              << "  " << sep << "\n";
+    iol.out << tool_header("mkdwarfs") << usage << opts << "\n"
+            << "Compression level defaults:\n"
+            << "  " << sep << "\n"
+            << fmt::format("  Level  Block  {:{}s} {:s}     Inode\n",
+                           "Compression Algorithm", 4 + l_dc + l_sc + l_mc,
+                           "Window")
+            << fmt::format("         Size   {:{}s}  {:{}s}  {:{}s} {:6s}\n",
+                           block_data_hdr, l_dc, schema_history_hdr, l_sc,
+                           metadata_hdr, l_mc, "Size/Step  Order")
+            << "  " << sep << "\n";
 
     int level = 0;
     for (auto const& l : levels) {
-      std::cout << fmt::format("  {:1d}      {:2d}     {:{}s}  {:{}s}  {:{}s}"
-                               "  {:2d} / {:1d}    {:{}s}",
-                               level, l.block_size_bits, l.data_compression,
-                               l_dc, l.schema_compression, l_sc,
-                               l.metadata_compression, l_mc, l.window_size,
-                               l.window_step, l.order, l_or)
-                << "\n";
+      iol.out << fmt::format("  {:1d}      {:2d}     {:{}s}  {:{}s}  {:{}s}"
+                             "  {:2d} / {:1d}    {:{}s}",
+                             level, l.block_size_bits, l.data_compression, l_dc,
+                             l.schema_history_compression, l_sc,
+                             l.metadata_compression, l_mc, l.window_size,
+                             l.window_step, l.order, l_or)
+              << "\n";
       ++level;
     }
 
-    std::cout << "  " << sep << "\n";
+    iol.out << "  " << sep << "\n";
 
-    std::cout << "\nCompression algorithms:\n";
+    iol.out << "\nCompression algorithms:\n";
 
     compression_registry::instance().for_each_algorithm(
-        [](compression_type, compression_info const& info) {
-          std::cout << fmt::format("  {:9}{}\n", info.name(),
-                                   info.description());
+        [&iol](compression_type, compression_info const& info) {
+          iol.out << fmt::format("  {:9}{}\n", info.name(), info.description());
           for (auto const& opt : info.options()) {
-            std::cout << fmt::format("               {}\n", opt);
+            iol.out << fmt::format("               {}\n", opt);
           }
         });
 
-    std::cout << "\n";
+    iol.out << "\nCategories:\n";
+
+    for (auto const& name : catreg.categorizer_names()) {
+      stream_logger lgr(iol.term, iol.err);
+      auto categorizer = catreg.create(lgr, name, vm);
+      iol.out << "  [" << name << "]\n";
+      for (auto cat : categorizer->categories()) {
+        iol.out << "    " << cat << "\n";
+      }
+    }
+
+    iol.out << "\n";
 
     return 0;
   }
 
   if (vm.count("help") or !(vm.count("input") or vm.count("input-list")) or
       (!vm.count("output") and !vm.count("debug-filter"))) {
-    std::cout << tool_header("mkdwarfs") << usage << "\n" << basic_opts << "\n";
+    iol.out << tool_header("mkdwarfs") << usage << "\n" << basic_opts << "\n";
     return 0;
   }
 
   if (level >= levels.size()) {
-    std::cerr << "error: invalid compression level\n";
+    iol.err << "error: invalid compression level\n";
     return 1;
   }
 
   auto const& defaults = levels[level];
 
-  if (!vm.count("block-size-bits")) {
-    cfg.block_size_bits = defaults.block_size_bits;
-  }
+  categorizer_list.add_defaults(categorize_defaults_common);
+  categorizer_list.add_defaults(*categorize_defaults_level[level]);
 
-  if (!vm.count("compression")) {
-    compression = defaults.data_compression;
+  if (!vm.count("block-size-bits")) {
+    sf_config.block_size_bits = defaults.block_size_bits;
   }
 
   if (!vm.count("schema-compression")) {
-    schema_compression = defaults.schema_compression;
+    schema_compression = defaults.schema_history_compression;
+  }
+
+  if (!vm.count("history-compression")) {
+    history_compression = defaults.schema_history_compression;
   }
 
   if (!vm.count("metadata-compression")) {
     metadata_compression = defaults.metadata_compression;
   }
 
-  if (!vm.count("window-size")) {
-    cfg.blockhash_window_size = defaults.window_size;
-  }
-
-  if (!vm.count("window-step")) {
-    cfg.window_increment_shift = defaults.window_step;
-  }
-
-  if (!vm.count("order")) {
-    order = defaults.order;
-  }
-
-  if (cfg.block_size_bits < min_block_size_bits ||
-      cfg.block_size_bits > max_block_size_bits) {
-    std::cerr << "error: block size must be between " << min_block_size_bits
-              << " and " << max_block_size_bits << "\n";
+  if (sf_config.block_size_bits < min_block_size_bits ||
+      sf_config.block_size_bits > max_block_size_bits) {
+    iol.err << "error: block size must be between " << min_block_size_bits
+            << " and " << max_block_size_bits << "\n";
     return 1;
   }
 
@@ -640,7 +771,7 @@ int mkdwarfs_main(int argc, sys_char** argv) {
 
   if (vm.count("input-list")) {
     if (vm.count("filter")) {
-      std::cerr << "error: cannot use --input-list and --filter\n";
+      iol.err << "error: cannot combine --input-list and --filter\n";
       return 1;
     }
 
@@ -649,23 +780,26 @@ int mkdwarfs_main(int argc, sys_char** argv) {
     options.with_specials = true;
 
     if (!vm.count("input")) {
-      path = std::filesystem::current_path();
+      path = iol.os->current_path();
     }
 
-    std::unique_ptr<std::ifstream> ifs;
+    std::filesystem::path input_list_path(input_list_str);
+    std::unique_ptr<input_stream> ifs;
     std::istream* is;
 
-    if (input_list_str == "-") {
-      is = &std::cin;
+    if (input_list_path == "-") {
+      is = &iol.in;
     } else {
-      ifs = std::make_unique<std::ifstream>(input_list_str);
+      std::error_code ec;
+      ifs = iol.file->open_input(input_list_path, ec);
 
-      if (!ifs->is_open()) {
-        throw std::runtime_error(
-            fmt::format("error opening file: {}", input_list_str));
+      if (ec) {
+        iol.err << "cannot open input list file '" << input_list_path
+                << "': " << ec.message() << "\n";
+        return 1;
       }
 
-      is = ifs.get();
+      is = &ifs->is();
     }
 
     std::string line;
@@ -676,7 +810,7 @@ int mkdwarfs_main(int argc, sys_char** argv) {
     }
   }
 
-  path = canonical_path(path);
+  path = iol.os->canonical(path);
 
   bool recompress = vm.count("recompress");
   rewrite_options rw_opts;
@@ -691,57 +825,18 @@ int mkdwarfs_main(int argc, sys_char** argv) {
       rw_opts.recompress_block = it->second & 1;
       rw_opts.recompress_metadata = it->second & 2;
     } else {
-      std::cerr << "invalid recompress mode: " << recompress_opts << "\n";
+      iol.err << "invalid recompress mode: " << recompress_opts << "\n";
       return 1;
     }
-  }
 
-  std::vector<std::string> order_opts;
-  boost::split(order_opts, order, boost::is_any_of(":"));
-
-  if (auto it = order_choices.find(order_opts.front());
-      it != order_choices.end()) {
-    options.file_order.mode = it->second;
-
-    if (order_opts.size() > 1) {
-      if (options.file_order.mode != file_order_mode::NILSIMSA) {
-        std::cerr << "error: inode order mode '" << order_opts.front()
-                  << "' does not support options\n";
-        return 1;
+    if (!recompress_categories.empty()) {
+      std::string_view input = recompress_categories;
+      if (input.front() == '!') {
+        rw_opts.recompress_categories_exclude = true;
+        input.remove_prefix(1);
       }
-
-      if (order_opts.size() > 4) {
-        std::cerr << "error: too many options for inode order mode '"
-                  << order_opts[0] << "'\n";
-        return 1;
-      }
-
-      auto ordname = order_opts[0];
-
-      if (parse_order_option(ordname, order_opts[1],
-                             options.file_order.nilsimsa_limit, "limit", 0,
-                             255)) {
-        return 1;
-      }
-
-      if (order_opts.size() > 2) {
-        if (parse_order_option(ordname, order_opts[2],
-                               options.file_order.nilsimsa_depth, "depth", 0)) {
-          return 1;
-        }
-      }
-
-      if (order_opts.size() > 3) {
-        if (parse_order_option(ordname, order_opts[3],
-                               options.file_order.nilsimsa_min_depth,
-                               "min depth", 0)) {
-          return 1;
-        }
-      }
+      boost::split(rw_opts.recompress_categories, input, boost::is_any_of(","));
     }
-  } else {
-    std::cerr << "error: invalid inode order mode: " << order << "\n";
-    return 1;
   }
 
   if (file_hash_algo == "none") {
@@ -749,8 +844,7 @@ int mkdwarfs_main(int argc, sys_char** argv) {
   } else if (checksum::is_available(file_hash_algo)) {
     options.file_hash_algorithm = file_hash_algo;
   } else {
-    std::cerr << "error: unknown file hash function '" << file_hash_algo
-              << "'\n";
+    iol.err << "error: unknown file hash function '" << file_hash_algo << "'\n";
     return 1;
   }
 
@@ -767,49 +861,47 @@ int mkdwarfs_main(int argc, sys_char** argv) {
     num_scanner_workers = num_workers;
   }
 
-  worker_group wg_compress("compress", num_workers,
-                           std::numeric_limits<size_t>::max(),
-                           compress_niceness);
-  worker_group wg_scanner("scanner", num_scanner_workers);
+  if (!vm.count("num-segmenter-workers")) {
+    num_segmenter_workers = num_workers;
+  }
+
+  options.num_segmenter_workers = num_segmenter_workers;
 
   if (vm.count("debug-filter")) {
     if (auto it = debug_filter_modes.find(debug_filter);
         it != debug_filter_modes.end()) {
-      options.debug_filter_function = [mode = it->second](bool exclude,
-                                                          entry const* pe) {
-        debug_filter_output(std::cout, exclude, pe, mode);
-      };
+      options.debug_filter_function =
+          [&iol, mode = it->second](bool exclude, entry const* pe) {
+            debug_filter_output(iol.out, exclude, pe, mode);
+          };
       no_progress = true;
     } else {
-      std::cerr << "error: invalid filter debug mode '" << debug_filter
-                << "'\n";
+      iol.err << "error: invalid filter debug mode '" << debug_filter << "'\n";
       return 1;
     }
   }
 
+  if (!progress_modes.count(progress_mode)) {
+    iol.err << "error: invalid progress mode '" << progress_mode << "'\n";
+    return 1;
+  }
   if (no_progress) {
     progress_mode = "none";
   }
-  if (progress_mode != "none" && !stream_is_fancy_terminal(std::cerr)) {
+  if (progress_mode != "none" && !iol.term->is_tty(iol.err)) {
     progress_mode = "simple";
-  }
-  if (!progress_modes.count(progress_mode)) {
-    std::cerr << "error: invalid progress mode '" << progress_mode << "'\n";
-    return 1;
   }
 
   auto pg_mode = DWARFS_NOTHROW(progress_modes.at(progress_mode));
-  auto log_level = logger::parse_level(log_level_str);
 
-  console_writer lgr(std::cerr, pg_mode, get_term_width, log_level,
-                     recompress ? console_writer::REWRITE
-                                : console_writer::NORMAL,
-                     log_level >= logger::DEBUG);
+  console_writer lgr(
+      iol.term, iol.err, pg_mode,
+      recompress ? console_writer::REWRITE : console_writer::NORMAL, logopts);
 
   std::shared_ptr<script> script;
 
   if (!filter.empty() or vm.count("chmod")) {
-    auto bs = std::make_shared<builtin_script>(lgr);
+    auto bs = std::make_shared<builtin_script>(lgr, iol.file);
 
     if (!filter.empty()) {
       bs->set_root_path(path);
@@ -819,8 +911,8 @@ int mkdwarfs_main(int argc, sys_char** argv) {
         try {
           bs->add_filter_rule(srule);
         } catch (std::exception const& e) {
-          std::cerr << "error: could not parse filter rule '" << srule
-                    << "': " << e.what() << "\n";
+          iol.err << "error: could not parse filter rule '" << srule
+                  << "': " << e.what() << "\n";
           return 1;
         }
       }
@@ -843,7 +935,7 @@ int mkdwarfs_main(int argc, sys_char** argv) {
       ::umask(mask);             /* Flawfinder: ignore */
 
       for (auto expr : chmod_exprs) {
-        bs->add_transformer(create_chmod_transformer(expr, mask));
+        bs->add_transformer(create_chmod_entry_transformer(expr, mask));
       }
     }
 
@@ -864,9 +956,15 @@ int mkdwarfs_main(int argc, sys_char** argv) {
     } else if (auto val = folly::tryTo<uint64_t>(timestamp)) {
       options.timestamp = *val;
     } else {
-      std::cerr << "error: argument for option '--set-time' must be numeric or "
-                   "`now`\n";
-      return 1;
+      try {
+        auto tp = parse_time_point(timestamp);
+        options.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                tp.time_since_epoch())
+                                .count();
+      } catch (std::exception const& e) {
+        iol.err << "error: " << e.what() << "\n";
+        return 1;
+      }
     }
   }
 
@@ -876,13 +974,12 @@ int mkdwarfs_main(int argc, sys_char** argv) {
   } else if (auto val = folly::tryTo<uint32_t>(time_resolution)) {
     options.time_resolution_sec = *val;
     if (options.time_resolution_sec == 0) {
-      std::cerr
-          << "error: the argument to '--time-resolution' must be nonzero\n";
+      iol.err << "error: the argument to '--time-resolution' must be nonzero\n";
       return 1;
     }
   } else {
-    std::cerr << "error: the argument ('" << time_resolution
-              << "') to '--time-resolution' is invalid\n";
+    iol.err << "error: the argument ('" << time_resolution
+            << "') to '--time-resolution' is invalid\n";
     return 1;
   }
 
@@ -928,8 +1025,8 @@ int mkdwarfs_main(int argc, sys_char** argv) {
           options.pack_symlinks = true;
           options.pack_symlinks_index = true;
         } else {
-          std::cerr << "error: the argument ('" << opt
-                    << "') to '--pack-metadata' is invalid\n";
+          iol.err << "error: the argument ('" << opt
+                  << "') to '--pack-metadata' is invalid\n";
           return 1;
         }
       }
@@ -943,126 +1040,326 @@ int mkdwarfs_main(int argc, sys_char** argv) {
 
   filesystem_writer_options fswopts;
   fswopts.max_queue_size = mem_limit;
+  fswopts.worst_case_block_size = UINT64_C(1) << sf_config.block_size_bits;
   fswopts.remove_header = remove_header;
   fswopts.no_section_index = no_section_index;
 
-  std::unique_ptr<std::ifstream> header_ifs;
+  std::unique_ptr<input_stream> header_ifs;
 
-  if (!header.empty()) {
-    header_ifs =
-        std::make_unique<std::ifstream>(header.c_str(), std::ios::binary);
-    if (header_ifs->bad() || !header_ifs->is_open()) {
-      std::cerr << "error: cannot open header file '" << header
-                << "': " << strerror(errno) << "\n";
+  if (!header_str.empty()) {
+    std::filesystem::path header(header_str);
+    std::error_code ec;
+    header_ifs = iol.file->open_input_binary(header, ec);
+    if (ec) {
+      iol.err << "error: cannot open header file '" << header
+              << "': " << ec.message() << "\n";
       return 1;
     }
   }
 
   LOG_PROXY(debug_logger_policy, lgr);
 
-  folly::Function<void(const progress&, bool)> updater;
+  folly::Function<void(progress&, bool)> updater;
 
   if (options.debug_filter_function) {
-    updater = [](const progress&, bool) {};
+    updater = [](progress&, bool) {};
   } else {
-    updater = [&](const progress& p, bool last) { lgr.update(p, last); };
+    updater = [&](progress& p, bool last) { lgr.update(p, last); };
   }
 
   progress prog(std::move(updater), interval_ms);
 
-  block_compressor bc(compression);
-  block_compressor schema_bc(schema_compression);
-  block_compressor metadata_bc(metadata_compression);
+  // No more streaming to iol.err after this point as this would
+  // cause a race with the progress thread.
 
-  auto min_memory_req = num_workers * (UINT64_C(1) << cfg.block_size_bits);
+  auto min_memory_req =
+      num_workers * (UINT64_C(1) << sf_config.block_size_bits);
 
-  if (mem_limit < min_memory_req && compression != "null") {
+  // TODO:
+  if (mem_limit < min_memory_req /* && compression != "null" */) {
     LOG_WARN << "low memory limit (" << size_with_unit(mem_limit) << "), need "
              << size_with_unit(min_memory_req) << " to efficiently compress "
-             << size_with_unit(UINT64_C(1) << cfg.block_size_bits)
+             << size_with_unit(UINT64_C(1) << sf_config.block_size_bits)
              << " blocks with " << num_workers << " threads";
   }
 
   std::filesystem::path output(output_str);
 
-  std::unique_ptr<std::ostream> os;
+  std::variant<std::monostate, std::unique_ptr<output_stream>,
+               std::ostringstream>
+      os;
 
   if (!options.debug_filter_function) {
-    if (std::filesystem::exists(output) && !force_overwrite) {
-      std::cerr
-          << "error: output file already exists, use --force to overwrite\n";
-      return 1;
+    if (output != "-") {
+      if (iol.file->exists(output) && !force_overwrite) {
+        LOG_ERROR << "output file already exists, use --force to overwrite";
+        return 1;
+      }
+
+      std::error_code ec;
+      auto stream = iol.file->open_output_binary(output, ec);
+
+      if (ec) {
+        LOG_ERROR << "cannot open output file '" << output
+                  << "': " << ec.message();
+        return 1;
+      }
+
+      assert(stream);
+
+      os.emplace<std::unique_ptr<output_stream>>(std::move(stream));
+    } else {
+#ifdef _WIN32
+      ::_setmode(::_fileno(stdout), _O_BINARY);
+#endif
     }
-
-    auto ofs = std::make_unique<std::ofstream>(output, std::ios::binary |
-                                                           std::ios::trunc);
-
-    if (ofs->bad() || !ofs->is_open()) {
-      std::cerr << "error: cannot open output file '" << output
-                << "': " << ::strerror(errno) << "\n";
-      return 1;
-    }
-
-    os = std::move(ofs);
   } else {
-    os = std::make_unique<std::ostringstream>();
+    os.emplace<std::ostringstream>();
   }
 
-  filesystem_writer fsw(*os, lgr, wg_compress, prog, bc, schema_bc, metadata_bc,
-                        fswopts, header_ifs.get());
+  options.enable_history = !no_history;
+  rw_opts.enable_history = !no_history;
+
+  if (options.enable_history) {
+    options.history.with_timestamps = !no_history_timestamps;
+    rw_opts.history.with_timestamps = !no_history_timestamps;
+
+    if (!no_history_command_line) {
+      options.command_line_arguments = command_line;
+      rw_opts.command_line_arguments = command_line;
+    }
+  }
+
+  if (!categorizer_list.value.empty()) {
+    std::vector<std::string> categorizers;
+    boost::split(categorizers, categorizer_list.value, boost::is_any_of(","));
+
+    options.inode.categorizer_mgr = std::make_shared<categorizer_manager>(lgr);
+
+    for (auto const& name : categorizers) {
+      options.inode.categorizer_mgr->add(catreg.create(lgr, name, vm));
+    }
+  }
+
+  std::unique_ptr<filesystem_v2> input_filesystem;
+  std::shared_ptr<category_resolver> cat_resolver;
+
+  if (recompress) {
+    filesystem_options fsopts;
+    fsopts.image_offset = filesystem_options::IMAGE_OFFSET_AUTO;
+    input_filesystem = std::make_unique<filesystem_v2>(
+        lgr, *iol.os, iol.os->map_file(path), fsopts);
+
+    LOG_INFO << "checking input filesystem...";
+
+    {
+      auto tv = LOG_TIMED_VERBOSE;
+
+      if (auto num_errors =
+              input_filesystem->check(filesystem_check_level::CHECKSUM);
+          num_errors != 0) {
+        LOG_ERROR << "input filesystem is corrupt: detected " << num_errors
+                  << " error(s)";
+        return 1;
+      }
+
+      tv << "checked input filesystem";
+    }
+
+    cat_resolver = std::make_shared<filesystem_block_category_resolver>(
+        input_filesystem->get_all_block_categories());
+
+    for (auto const& cat : rw_opts.recompress_categories) {
+      if (!cat_resolver->category_value(cat)) {
+        LOG_ERROR << "no category '" << cat << "' in input filesystem";
+        return 1;
+      }
+    }
+  } else {
+    cat_resolver = options.inode.categorizer_mgr;
+  }
+
+  category_parser cp(cat_resolver);
+
+  try {
+    {
+      contextual_option_parser cop("--order", options.inode.fragment_order, cp,
+                                   order_parser);
+      cop.parse(defaults.order);
+      cop.parse(order);
+      categorizer_list.add_implicit_defaults(cop);
+      LOG_VERBOSE << cop.as_string();
+    }
+
+    {
+      contextual_option_parser cop("--max-lookback-blocks",
+                                   sf_config.max_active_blocks, cp,
+                                   max_lookback_parser);
+      sf_config.max_active_blocks.set_default(kDefaultMaxActiveBlocks);
+      cop.parse(max_lookback_blocks);
+      categorizer_list.add_implicit_defaults(cop);
+      LOG_VERBOSE << cop.as_string();
+    }
+
+    {
+      contextual_option_parser cop("--window-size",
+                                   sf_config.blockhash_window_size, cp,
+                                   window_size_parser);
+      sf_config.blockhash_window_size.set_default(defaults.window_size);
+      cop.parse(window_size);
+      categorizer_list.add_implicit_defaults(cop);
+      LOG_VERBOSE << cop.as_string();
+    }
+
+    {
+      contextual_option_parser cop("--window-step",
+                                   sf_config.window_increment_shift, cp,
+                                   window_step_parser);
+      sf_config.window_increment_shift.set_default(defaults.window_step);
+      cop.parse(window_step);
+      categorizer_list.add_implicit_defaults(cop);
+      LOG_VERBOSE << cop.as_string();
+    }
+
+    {
+      contextual_option_parser cop("--bloom-filter-size",
+                                   sf_config.bloom_filter_size, cp,
+                                   bloom_filter_size_parser);
+      sf_config.bloom_filter_size.set_default(kDefaultBloomFilterSize);
+      cop.parse(bloom_filter_size);
+      categorizer_list.add_implicit_defaults(cop);
+      LOG_VERBOSE << cop.as_string();
+    }
+  } catch (std::exception const& e) {
+    LOG_ERROR << e.what();
+    return 1;
+  }
+
+  block_compressor schema_bc(schema_compression);
+  block_compressor metadata_bc(metadata_compression);
+  block_compressor history_bc(history_compression);
+
+  worker_group wg_compress(lgr, *iol.os, "compress", num_workers,
+                           std::numeric_limits<size_t>::max(),
+                           compress_niceness);
+
+  std::unique_ptr<filesystem_writer> fsw;
+
+  try {
+    std::ostream& fsw_os = std::visit(
+        overloaded(
+            [&](std::monostate) -> std::ostream& { return iol.out; },
+            [&](std::unique_ptr<output_stream>& os) -> std::ostream& {
+              return os->os();
+            },
+            [&](std::ostringstream& oss) -> std::ostream& { return oss; }),
+        os);
+
+    fsw = std::make_unique<filesystem_writer>(
+        fsw_os, lgr, wg_compress, prog, schema_bc, metadata_bc, history_bc,
+        fswopts, header_ifs ? &header_ifs->is() : nullptr);
+
+    categorized_option<block_compressor> compression_opt;
+    contextual_option_parser cop("--compression", compression_opt, cp,
+                                 compressor_parser);
+    compression_opt.set_default(
+        block_compressor(std::string(defaults.data_compression)));
+    cop.parse(compression);
+    categorizer_list.add_implicit_defaults(cop);
+    LOG_VERBOSE << cop.as_string();
+
+    {
+      auto bc = compression_opt.get();
+
+      if (!bc.metadata_requirements().empty()) {
+        throw std::runtime_error(
+            fmt::format("compression '{}' cannot be used without a category: "
+                        "metadata requirements not met",
+                        bc.describe()));
+      }
+
+      fsw->add_default_compressor(std::move(bc));
+    }
+
+    if (recompress) {
+      compression_opt.visit_contextual(
+          [catres = cat_resolver, &fsw](auto cat, block_compressor const& bc) {
+            fsw->add_category_compressor(cat, bc);
+          });
+    } else {
+      compression_opt.visit_contextual([catmgr = options.inode.categorizer_mgr,
+                                        &fsw](auto cat,
+                                              block_compressor const& bc) {
+        try {
+          catmgr->set_metadata_requirements(cat, bc.metadata_requirements());
+          fsw->add_category_compressor(cat, bc);
+        } catch (std::exception const& e) {
+          throw std::runtime_error(
+              fmt::format("compression '{}' cannot be used for category '{}': "
+                          "metadata requirements not met ({})",
+                          bc.describe(), catmgr->category_name(cat), e.what()));
+        }
+      });
+    }
+  } catch (std::exception const& e) {
+    LOG_ERROR << e.what();
+    return 1;
+  }
 
   auto ti = LOG_TIMED_INFO;
 
   try {
     if (recompress) {
-      filesystem_v2::rewrite(lgr, prog, std::make_shared<dwarfs::mmap>(path),
-                             fsw, rw_opts);
+      input_filesystem->rewrite(prog, *fsw, *cat_resolver, rw_opts);
       wg_compress.wait();
     } else {
-      options.inode.with_similarity =
-          options.file_order.mode == file_order_mode::SIMILARITY;
-      options.inode.with_nilsimsa =
-          options.file_order.mode == file_order_mode::NILSIMSA;
+      auto sf = std::make_shared<segmenter_factory>(
+          lgr, prog, options.inode.categorizer_mgr, sf_config);
 
-      scanner s(lgr, wg_scanner, cfg, entry_factory::create(),
-                std::make_shared<os_access_generic>(), std::move(script),
-                options);
+      worker_group wg_scanner(lgr, *iol.os, "scanner", num_scanner_workers);
 
-      if (input_list) {
-        s.scan(fsw, path, prog, *input_list);
-      } else {
-        s.scan(fsw, path, prog);
-      }
+      scanner s(lgr, wg_scanner, std::move(sf), entry_factory::create(), iol.os,
+                std::move(script), options);
+
+      s.scan(*fsw, path, prog, input_list, iol.file);
+
+      options.inode.categorizer_mgr.reset();
     }
-  } catch (runtime_error const& e) {
-    LOG_ERROR << e.what();
-    return 1;
-  } catch (system_error const& e) {
-    LOG_ERROR << e.what();
+  } catch (std::exception const& e) {
+    LOG_ERROR << folly::exceptionStr(e);
     return 1;
   }
 
   if (!options.debug_filter_function) {
     LOG_INFO << "compression CPU time: "
-             << time_with_unit(wg_compress.get_cpu_time());
+             << time_with_unit(wg_compress.get_cpu_time().value_or(
+                    std::chrono::nanoseconds(0)));
   }
 
-  if (auto ofs = dynamic_cast<std::ofstream*>(os.get())) {
-    ofs->close();
+  {
+    auto ec = std::visit(
+        overloaded([](std::monostate) -> int { return 0; },
+                   [&](std::unique_ptr<output_stream>& os) -> int {
+                     std::error_code ec;
+                     os->close(ec);
+                     if (ec) {
+                       LOG_ERROR << "failed to close output file '" << output
+                                 << "': " << ec.message();
+                       return 1;
+                     }
+                     os.reset();
+                     return 0;
+                   },
+                   [](std::ostringstream& oss [[maybe_unused]]) -> int {
+                     assert(oss.str().empty());
+                     return 0;
+                   }),
+        os);
 
-    if (ofs->bad()) {
-      LOG_ERROR << "failed to close output file '" << output
-                << "': " << strerror(errno);
-      return 1;
+    if (ec != 0) {
+      return ec;
     }
-  } else if (auto oss [[maybe_unused]] =
-                 dynamic_cast<std::ostringstream*>(os.get())) {
-    assert(oss->str().empty());
-  } else {
-    assert(false);
   }
-
-  os.reset();
 
   if (!options.debug_filter_function) {
     std::ostringstream err;
@@ -1080,7 +1377,19 @@ int mkdwarfs_main(int argc, sys_char** argv) {
        << err.str();
   }
 
-  return prog.errors > 0;
+  return prog.errors > 0 ? 2 : 0;
+}
+
+int mkdwarfs_main(int argc, sys_char** argv) {
+  return mkdwarfs_main(argc, argv, iolayer::system_default());
+}
+
+int mkdwarfs_main(std::span<std::string> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, mkdwarfs_main);
+}
+
+int mkdwarfs_main(std::span<std::string_view> args, iolayer const& iol) {
+  return call_sys_main_iolayer(args, iol, mkdwarfs_main);
 }
 
 } // namespace dwarfs
